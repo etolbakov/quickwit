@@ -89,7 +89,7 @@ impl MetastoreGrpcClient {
             balance_channel.clone(),
             SpanContextInterceptor,
         );
-        let uri = QuickwitUri::from_well_formed(GRPC_METASTORE_BASE_URI);
+        let uri = QuickwitUri::for_test(GRPC_METASTORE_BASE_URI);
         Ok(Self {
             underlying,
             balance_channel,
@@ -123,7 +123,7 @@ impl MetastoreGrpcClient {
         Ok(Self {
             underlying,
             balance_channel,
-            uri: QuickwitUri::from_well_formed(GRPC_METASTORE_BASE_URI),
+            uri: QuickwitUri::for_test(GRPC_METASTORE_BASE_URI),
         })
     }
 }
