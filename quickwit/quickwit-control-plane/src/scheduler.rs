@@ -20,7 +20,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -28,12 +27,15 @@ use async_trait::async_trait;
 use itertools::Itertools;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler};
 use quickwit_config::{SourceConfig, INGEST_SOURCE_ID};
-use quickwit_metastore::{ListIndexesQuery, Metastore};
+use quickwit_metastore::{IndexMetadata, ListIndexesMetadataRequestExt, ListIndexesResponseExt};
 use quickwit_proto::control_plane::{
     ControlPlaneResult, NotifyIndexChangeRequest, NotifyIndexChangeResponse,
 };
 use quickwit_proto::indexing::{ApplyIndexingPlanRequest, IndexingService, IndexingTask};
-use quickwit_proto::metastore::{ListShardsRequest, ListShardsSubrequest};
+use quickwit_proto::metastore::{
+    ListIndexesMetadatasRequest, ListShardsRequest, ListShardsSubrequest, MetastoreService,
+    MetastoreServiceClient,
+};
 use quickwit_proto::{NodeId, ShardId};
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
@@ -112,7 +114,7 @@ pub struct IndexingSchedulerState {
 pub struct IndexingScheduler {
     cluster_id: String,
     self_node_id: NodeId,
-    metastore: Arc<dyn Metastore>,
+    metastore: MetastoreServiceClient,
     indexer_pool: IndexerPool,
     state: IndexingSchedulerState,
 }
@@ -122,7 +124,7 @@ impl fmt::Debug for IndexingScheduler {
         f.debug_struct("IndexingScheduler")
             .field("cluster_id", &self.cluster_id)
             .field("node_id", &self.self_node_id)
-            .field("metastore_uri", &self.metastore.uri())
+            .field("metastore", &self.metastore)
             .field(
                 "last_applied_plan_ts",
                 &self.state.last_applied_plan_timestamp,
@@ -155,7 +157,7 @@ impl IndexingScheduler {
     pub fn new(
         cluster_id: String,
         self_node_id: NodeId,
-        metastore: Arc<dyn Metastore>,
+        metastore: MetastoreServiceClient,
         indexer_pool: IndexerPool,
     ) -> Self {
         Self {
@@ -204,11 +206,12 @@ impl IndexingScheduler {
         Ok(())
     }
 
-    async fn fetch_source_configs(&self) -> anyhow::Result<HashMap<SourceUid, SourceConfig>> {
-        let indexes_metadatas = self
+    async fn fetch_source_configs(&mut self) -> anyhow::Result<HashMap<SourceUid, SourceConfig>> {
+        let indexes_metadatas: Vec<IndexMetadata> = self
             .metastore
-            .list_indexes_metadatas(ListIndexesQuery::All)
-            .await?;
+            .list_indexes_metadatas(ListIndexesMetadatasRequest::all())
+            .await?
+            .deserialize_indexes_metadata()?;
         let source_configs: HashMap<SourceUid, SourceConfig> = indexes_metadatas
             .into_iter()
             .flat_map(|index_metadata| {
@@ -254,6 +257,7 @@ impl IndexingScheduler {
         };
         let list_shards_response = self
             .metastore
+            .clone()
             .list_shards(list_shards_request)
             .await
             .context("failed to list shards from metastore")?;
@@ -597,9 +601,12 @@ mod tests {
     use quickwit_config::service::QuickwitService;
     use quickwit_config::{KafkaSourceParams, SourceConfig, SourceInputFormat, SourceParams};
     use quickwit_indexing::IndexingService;
-    use quickwit_metastore::{IndexMetadata, ListIndexesQuery, MockMetastore};
+    use quickwit_metastore::{IndexMetadata, ListIndexesResponseExt};
     use quickwit_proto::indexing::{ApplyIndexingPlanRequest, IndexingServiceClient, IndexingTask};
-    use quickwit_proto::metastore::ListShardsResponse;
+    use quickwit_proto::metastore::{
+        ListIndexesMetadatasResponse, ListShardsResponse, MetastoreServiceClient,
+        MockMetastoreService,
+    };
     use quickwit_proto::NodeId;
     use serde_json::json;
 
@@ -681,10 +688,14 @@ mod tests {
         let index_metadata_1 = index_metadata_for_test(index_1, source_1, 2, 2);
         let mut index_metadata_2 = index_metadata_for_test(index_2, source_2, 1, 1);
         index_metadata_2.create_timestamp = index_metadata_1.create_timestamp + 1;
-        let mut metastore = MockMetastore::default();
+        let mut metastore = MockMetastoreService::default();
         metastore.expect_list_indexes_metadatas().returning(
-            move |_list_indexes_query: ListIndexesQuery| {
-                Ok(vec![index_metadata_2.clone(), index_metadata_1.clone()])
+            move |_list_indexes_metadata_request| {
+                let indexes_metadata = vec![index_metadata_2.clone(), index_metadata_1.clone()];
+                Ok(
+                    ListIndexesMetadatasResponse::try_from_indexes_metadata(indexes_metadata)
+                        .unwrap(),
+                )
             },
         );
         metastore.expect_list_shards().returning(|_| {
@@ -708,7 +719,7 @@ mod tests {
         let indexing_scheduler = IndexingScheduler::new(
             cluster.cluster_id().to_string(),
             self_node_id,
-            Arc::new(metastore),
+            MetastoreServiceClient::new(metastore),
             indexer_pool,
         );
         let (_, scheduler_handler) = universe.spawn_builder().spawn(indexing_scheduler);

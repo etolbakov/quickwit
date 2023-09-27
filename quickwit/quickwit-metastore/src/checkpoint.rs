@@ -158,6 +158,7 @@ impl From<&str> for Position {
     }
 }
 
+// TODO: Remove `PartitionDelta` and generalize use of `quickwit_proto::PartitionDelta` instead.
 /// A partition delta represents an interval (from, to] over a partition of a source.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartitionDelta {

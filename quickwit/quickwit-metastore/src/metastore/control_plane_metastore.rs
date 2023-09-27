@@ -40,7 +40,7 @@ use crate::{IndexMetadata, ListIndexesQuery, ListSplitsQuery, Metastore, Split, 
 /// track the state of the metastore accurately and react to events in real-time.
 pub struct ControlPlaneMetastore {
     control_plane: ControlPlaneServiceClient,
-    metastore: Arc<dyn Metastore>,
+    metastore: MetastoreServiceClient,
 }
 
 impl fmt::Debug for ControlPlaneMetastore {
@@ -51,7 +51,7 @@ impl fmt::Debug for ControlPlaneMetastore {
 
 impl ControlPlaneMetastore {
     /// Creates a new [`ControlPlaneMetastore`].
-    pub fn new(control_plane: ControlPlaneServiceClient, metastore: Arc<dyn Metastore>) -> Self {
+    pub fn new(control_plane: ControlPlaneServiceClient, metastore: MetastoreServiceClient) -> Self {
         Self {
             control_plane,
             metastore,

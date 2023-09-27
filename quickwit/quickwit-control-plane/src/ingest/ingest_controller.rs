@@ -22,7 +22,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -31,7 +30,7 @@ use itertools::Itertools;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler};
 use quickwit_config::INGEST_SOURCE_ID;
 use quickwit_ingest::IngesterPool;
-use quickwit_metastore::{ListIndexesQuery, Metastore};
+use quickwit_metastore::{ListIndexesMetadataRequestExt, ListIndexesQuery, ListIndexesResponseExt};
 use quickwit_proto::control_plane::{
     CloseShardsRequest, CloseShardsResponse, ControlPlaneError, ControlPlaneResult,
     GetOpenShardsRequest, GetOpenShardsResponse, GetOpenShardsSubresponse,
@@ -41,7 +40,10 @@ use quickwit_proto::ingest::{IngestV2Error, Shard, ShardState};
 use quickwit_proto::metastore::events::{
     AddSourceEvent, CreateIndexEvent, DeleteIndexEvent, DeleteSourceEvent,
 };
-use quickwit_proto::metastore::{EntityKind, MetastoreError};
+use quickwit_proto::metastore::{
+    EntityKind, ListIndexesMetadatasRequest, MetastoreError, MetastoreService,
+    MetastoreServiceClient,
+};
 use quickwit_proto::types::{IndexId, NodeId, SourceId};
 use quickwit_proto::{metastore, IndexUid, NodeIdRef, ShardId};
 use rand::seq::SliceRandom;
@@ -235,7 +237,7 @@ impl ShardTable {
 }
 
 pub struct IngestController {
-    metastore: Arc<dyn Metastore>,
+    metastore: MetastoreServiceClient,
     ingester_pool: IngesterPool,
     index_table: HashMap<IndexId, IndexUid>,
     shard_table: ShardTable,
@@ -244,7 +246,7 @@ pub struct IngestController {
 
 impl IngestController {
     pub fn new(
-        metastore: Arc<dyn Metastore>,
+        metastore: MetastoreServiceClient,
         ingester_pool: IngesterPool,
         replication_factor: usize,
     ) -> Self {
@@ -265,8 +267,12 @@ impl IngestController {
         self.shard_table.clear();
 
         let indexes = ctx
-            .protect_future(self.metastore.list_indexes_metadatas(ListIndexesQuery::All))
-            .await?;
+            .protect_future(
+                self.metastore
+                    .list_indexes_metadatas(ListIndexesMetadatasRequest::all()),
+            )
+            .await?
+            .deserialize_indexes_metadata()?;
 
         self.index_table.reserve(indexes.len());
 
@@ -687,12 +693,13 @@ mod tests {
 
     use quickwit_actors::Universe;
     use quickwit_config::SourceConfig;
-    use quickwit_metastore::{IndexMetadata, MockMetastore};
+    use quickwit_metastore::IndexMetadata;
     use quickwit_proto::control_plane::GetOpenShardsSubrequest;
     use quickwit_proto::ingest::ingester::{
         IngesterServiceClient, MockIngesterService, PingResponse,
     };
     use quickwit_proto::ingest::{IngestV2Error, Shard};
+    use quickwit_proto::metastore::{ListIndexesMetadatasResponse, MockMetastoreService};
     use tokio::sync::watch;
 
     use super::*;
@@ -899,10 +906,10 @@ mod tests {
         let (observable_state_tx, _observable_state_rx) = watch::channel(json!({}));
         let ctx = ActorContext::for_test(&universe, mailbox, observable_state_tx);
 
-        let mut mock_metastore = MockMetastore::default();
-        mock_metastore
-            .expect_list_indexes_metadatas()
-            .returning(|query| {
+        let mut mock_metastore = MockMetastoreService::default();
+        mock_metastore.expect_list_indexes_metadatas().returning(
+            |request: ListIndexesMetadatasRequest| {
+                let query = request.deserialize_list_indexes_query().unwrap();
                 assert!(matches!(query, ListIndexesQuery::All));
 
                 let mut index_0 = IndexMetadata::for_test("test-index-0", "ram:///test-index-0");
@@ -913,8 +920,9 @@ mod tests {
                 index_1.add_source(source).unwrap();
 
                 let indexes = vec![index_0, index_1];
-                Ok(indexes)
-            });
+                Ok(ListIndexesMetadatasResponse::try_from_indexes_metadata(indexes).unwrap())
+            },
+        );
         mock_metastore.expect_list_shards().returning(|request| {
             assert_eq!(request.subrequests.len(), 2);
 
@@ -946,11 +954,13 @@ mod tests {
             let response = metastore::ListShardsResponse { subresponses };
             Ok(response)
         });
-        let metastore = Arc::new(mock_metastore);
         let ingester_pool = IngesterPool::default();
         let replication_factor = 1;
-        let mut ingest_controller =
-            IngestController::new(metastore, ingester_pool, replication_factor);
+        let mut ingest_controller = IngestController::new(
+            MetastoreServiceClient::new(mock_metastore),
+            ingester_pool,
+            replication_factor,
+        );
 
         ingest_controller.load_state(&ctx).await.unwrap();
 
@@ -995,12 +1005,14 @@ mod tests {
         let (observable_state_tx, _observable_state_rx) = watch::channel(json!({}));
         let ctx = ActorContext::for_test(&universe, mailbox, observable_state_tx);
 
-        let mock_metastore = MockMetastore::default();
-        let metastore = Arc::new(mock_metastore);
+        let mock_metastore = MockMetastoreService::default();
         let ingester_pool = IngesterPool::default();
         let replication_factor = 1;
-        let mut ingest_controller =
-            IngestController::new(metastore, ingester_pool.clone(), replication_factor);
+        let mut ingest_controller = IngestController::new(
+            MetastoreServiceClient::new(mock_metastore),
+            ingester_pool.clone(),
+            replication_factor,
+        );
 
         let leader_id: NodeId = "test-ingester-0".into();
         let error = ingest_controller
@@ -1077,12 +1089,14 @@ mod tests {
         let (observable_state_tx, _observable_state_rx) = watch::channel(json!({}));
         let ctx = ActorContext::for_test(&universe, mailbox, observable_state_tx);
 
-        let mock_metastore = MockMetastore::default();
-        let metastore = Arc::new(mock_metastore);
+        let mock_metastore = MockMetastoreService::default();
         let ingester_pool = IngesterPool::default();
         let replication_factor = 1;
-        let mut ingest_controller =
-            IngestController::new(metastore, ingester_pool.clone(), replication_factor);
+        let mut ingest_controller = IngestController::new(
+            MetastoreServiceClient::new(mock_metastore),
+            ingester_pool.clone(),
+            replication_factor,
+        );
 
         let leader_follower_pair = ingest_controller
             .find_leader_and_follower(&ctx, &mut HashSet::new())
@@ -1133,12 +1147,14 @@ mod tests {
         let (observable_state_tx, _observable_state_rx) = watch::channel(json!({}));
         let ctx = ActorContext::for_test(&universe, mailbox, observable_state_tx);
 
-        let mock_metastore = MockMetastore::default();
-        let metastore = Arc::new(mock_metastore);
+        let mock_metastore = MockMetastoreService::default();
         let ingester_pool = IngesterPool::default();
         let replication_factor = 2;
-        let mut ingest_controller =
-            IngestController::new(metastore, ingester_pool.clone(), replication_factor);
+        let mut ingest_controller = IngestController::new(
+            MetastoreServiceClient::new(mock_metastore),
+            ingester_pool.clone(),
+            replication_factor,
+        );
 
         let leader_follower_pair = ingest_controller
             .find_leader_and_follower(&ctx, &mut HashSet::new())
@@ -1225,7 +1241,7 @@ mod tests {
         let (observable_state_tx, _observable_state_rx) = watch::channel(json!({}));
         let ctx = ActorContext::for_test(&universe, mailbox, observable_state_tx);
 
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_open_shards()
             .once()
@@ -1247,7 +1263,6 @@ mod tests {
                 let response = metastore::OpenShardsResponse { subresponses };
                 Ok(response)
             });
-        let metastore = Arc::new(mock_metastore);
         let ingester_pool = IngesterPool::default();
 
         let mut mock_ingester = MockIngesterService::default();
@@ -1269,8 +1284,11 @@ mod tests {
             .await;
 
         let replication_factor = 2;
-        let mut ingest_controller =
-            IngestController::new(metastore, ingester_pool.clone(), replication_factor);
+        let mut ingest_controller = IngestController::new(
+            MetastoreServiceClient::new(mock_metastore),
+            ingester_pool.clone(),
+            replication_factor,
+        );
 
         ingest_controller
             .index_table

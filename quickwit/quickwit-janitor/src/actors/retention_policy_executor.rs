@@ -18,14 +18,16 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use itertools::Itertools;
 use quickwit_actors::{Actor, ActorContext, Handler};
 use quickwit_config::IndexConfig;
-use quickwit_metastore::{ListIndexesQuery, Metastore};
+use quickwit_metastore::{ListIndexesMetadataRequestExt, ListIndexesResponseExt};
+use quickwit_proto::metastore::{
+    ListIndexesMetadatasRequest, MetastoreService, MetastoreServiceClient,
+};
 use quickwit_proto::IndexUid;
 use serde::Serialize;
 use tracing::{debug, error, info};
@@ -58,7 +60,7 @@ struct Execute {
 /// It keeps a list of indexes that have retention policy configured
 /// in a cache and periodically update this list.
 pub struct RetentionPolicyExecutor {
-    metastore: Arc<dyn Metastore>,
+    metastore: MetastoreServiceClient,
     /// A map of index_id to index metadata that are managed by this executor.
     /// This act as local cache that is periodically updated while taking into
     /// account deleted indexes, updated or removed retention policy on indexes.
@@ -67,7 +69,7 @@ pub struct RetentionPolicyExecutor {
 }
 
 impl RetentionPolicyExecutor {
-    pub fn new(metastore: Arc<dyn Metastore>) -> Self {
+    pub fn new(metastore: MetastoreServiceClient) -> Self {
         Self {
             metastore,
             index_configs: HashMap::new(),
@@ -83,8 +85,9 @@ impl RetentionPolicyExecutor {
 
         let index_metadatas = match self
             .metastore
-            .list_indexes_metadatas(ListIndexesQuery::All)
+            .list_indexes_metadatas(ListIndexesMetadatasRequest::all())
             .await
+            .and_then(|response| response.deserialize_indexes_metadata())
         {
             Ok(metadatas) => metadatas,
             Err(error) => {
@@ -253,7 +256,11 @@ mod tests {
     use quickwit_actors::Universe;
     use quickwit_config::RetentionPolicy;
     use quickwit_metastore::{
-        IndexMetadata, ListIndexesQuery, MockMetastore, Split, SplitMetadata, SplitState,
+        IndexMetadata, ListSplitsRequestExt, ListSplitsResponseExt, Split, SplitMetadata,
+        SplitState,
+    };
+    use quickwit_proto::metastore::{
+        EmptyResponse, ListIndexesMetadatasResponse, ListSplitsResponse, MockMetastoreService,
     };
 
     use super::*;
@@ -336,50 +343,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_retention_executor_refresh() -> anyhow::Result<()> {
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
 
         let mut sequence = Sequence::new();
         mock_metastore
             .expect_list_splits()
             .times(..)
-            .returning(|_| Ok(Vec::new()));
+            .returning(|_| Ok(ListSplitsResponse::empty()));
         mock_metastore
             .expect_list_indexes_metadatas()
             .times(1)
             .in_sequence(&mut sequence)
-            .returning(|_list_indexes_query: ListIndexesQuery| {
-                Ok(make_indexes(&[
-                    ("a", Some("1 hour")),
-                    ("b", Some("1 hour")),
-                    ("c", None),
-                ]))
+            .returning(|_list_indexes_request| {
+                let indexes_metadata =
+                    make_indexes(&[("a", Some("1 hour")), ("b", Some("1 hour")), ("c", None)]);
+                Ok(
+                    ListIndexesMetadatasResponse::try_from_indexes_metadata(indexes_metadata)
+                        .unwrap(),
+                )
             });
 
         mock_metastore
             .expect_list_indexes_metadatas()
             .times(1)
             .in_sequence(&mut sequence)
-            .returning(|_list_indexes_query: ListIndexesQuery| {
-                Ok(make_indexes(&[
+            .returning(|_list_indexes_request| {
+                let indexes_metadata = make_indexes(&[
                     ("a", Some("1 hour")),
                     ("b", Some("2 hour")),
                     ("c", Some("1 hour")),
-                ]))
+                ]);
+                Ok(
+                    ListIndexesMetadatasResponse::try_from_indexes_metadata(indexes_metadata)
+                        .unwrap(),
+                )
             });
 
         mock_metastore
             .expect_list_indexes_metadatas()
             .times(1)
             .in_sequence(&mut sequence)
-            .returning(|_list_indexes_query: ListIndexesQuery| {
-                Ok(make_indexes(&[
-                    ("b", Some("1 hour")),
-                    ("d", Some("1 hour")),
-                    ("e", None),
-                ]))
+            .returning(|_list_indexes_request| {
+                let indexes_metadata =
+                    make_indexes(&[("b", Some("1 hour")), ("d", Some("1 hour")), ("e", None)]);
+                Ok(
+                    ListIndexesMetadatasResponse::try_from_indexes_metadata(indexes_metadata)
+                        .unwrap(),
+                )
             });
 
-        let retention_policy_executor = RetentionPolicyExecutor::new(Arc::new(mock_metastore));
+        let retention_policy_executor =
+            RetentionPolicyExecutor::new(MetastoreServiceClient::new(mock_metastore));
         let universe = Universe::with_accelerated_time();
         let (mailbox, handle) = universe.spawn_builder().spawn(retention_policy_executor);
 
@@ -419,22 +433,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_retention_policy_execution_calls_dependencies() -> anyhow::Result<()> {
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_list_indexes_metadatas()
             .times(..)
-            .returning(|_list_indexes_query: ListIndexesQuery| {
-                Ok(make_indexes(&[
-                    ("a", Some("2 hour")),
-                    ("b", Some("1 hour")),
-                    ("c", None),
-                ]))
+            .returning(|_list_indexes_request| {
+                let indexes_metadata =
+                    make_indexes(&[("a", Some("2 hour")), ("b", Some("1 hour")), ("c", None)]);
+                Ok(
+                    ListIndexesMetadatasResponse::try_from_indexes_metadata(indexes_metadata)
+                        .unwrap(),
+                )
             });
 
         mock_metastore
             .expect_list_splits()
             .times(2..=4)
-            .returning(|query| {
+            .returning(|list_splits_request| {
+                let query = list_splits_request.deserialize_list_splits_query().unwrap();
                 assert_eq!(query.split_states, &[SplitState::Published]);
                 let splits = match query.index_uids[0].index_id() {
                     "a" => {
@@ -447,19 +463,24 @@ mod tests {
                     "b" => Vec::new(),
                     unknown => panic!("Unknown index: `{unknown}`."),
                 };
-                Ok(splits)
+                Ok(ListSplitsResponse::try_from_splits(splits).unwrap())
             });
 
         mock_metastore
             .expect_mark_splits_for_deletion()
             .times(1..=3)
-            .returning(|index_uid, split_ids| {
+            .returning(|mark_splits_for_deletion_request| {
+                let index_uid: IndexUid = mark_splits_for_deletion_request.index_uid.clone().into();
                 assert_eq!(index_uid.index_id(), "a");
-                assert_eq!(split_ids, ["split-1", "split-2"]);
-                Ok(())
+                assert_eq!(
+                    mark_splits_for_deletion_request.split_ids,
+                    ["split-1", "split-2"]
+                );
+                Ok(EmptyResponse::default())
             });
 
-        let retention_policy_executor = RetentionPolicyExecutor::new(Arc::new(mock_metastore));
+        let retention_policy_executor =
+            RetentionPolicyExecutor::new(MetastoreServiceClient::new(mock_metastore));
         let universe = Universe::with_accelerated_time();
         let (_mailbox, handle) = universe.spawn_builder().spawn(retention_policy_executor);
 

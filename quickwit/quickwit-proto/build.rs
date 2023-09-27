@@ -62,16 +62,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap();
 
-    // "Classic" prost + tonic codegen for metastore and search services.
-    let mut prost_config = prost_build::Config::default();
-    prost_config
+    // Metastore service
+    let mut metastore_api_config = prost_build::Config::default();
+    metastore_api_config
         .bytes(["DocBatchV2.doc_buffer"])
-        .protoc_arg("--experimental_allow_proto3_optional");
-
-    tonic_build::configure()
-        .enum_attribute(".", "#[serde(rename_all=\"snake_case\")]")
         .field_attribute("DeleteQuery.index_uid", "#[serde(alias = \"index_id\")]")
         .field_attribute("DeleteQuery.query_ast", "#[serde(alias = \"query\")]")
+        .type_attribute("Shard", "#[derive(Eq)]")
         .field_attribute(
             "DeleteQuery.start_timestamp",
             "#[serde(skip_serializing_if = \"Option::is_none\")]",
@@ -95,22 +92,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(
             "Shard.replication_position_inclusive",
             "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
-        )
+        );
+
+    Codegen::run_with_config(
+        &["protos/quickwit/metastore.proto"],
+        "src/codegen/quickwit",
+        "crate::metastore::MetastoreResult",
+        "crate::metastore::MetastoreError",
+        &["protos"],
+        metastore_api_config,
+    )
+    .unwrap();
+
+    // "Classic" prost + tonic codegen for search service.
+    let mut prost_config = prost_build::Config::default();
+    prost_config
+        .bytes(["DocBatchV2.doc_buffer"])
+        .type_attribute("Shard", "#[derive(Eq)]")
+        .protoc_arg("--experimental_allow_proto3_optional");
+
+    tonic_build::configure()
+        .enum_attribute(".", "#[serde(rename_all=\"snake_case\")]")
         .type_attribute(".", "#[derive(Serialize, Deserialize, utoipa::ToSchema)]")
         .type_attribute("PartialHit.sort_value", "#[derive(Copy)]")
         .type_attribute("SearchRequest", "#[derive(Eq, Hash)]")
-        .type_attribute("Shard", "#[derive(Eq)]")
         .type_attribute("SortByValue", "#[derive(Ord, PartialOrd)]")
         .type_attribute("SortField", "#[derive(Eq, Hash)]")
+        .type_attribute("Shard", "#[derive(Eq)]")
         .out_dir("src/codegen/quickwit")
-        .compile_with_config(
-            prost_config,
-            &[
-                "protos/quickwit/metastore.proto",
-                "protos/quickwit/search.proto",
-            ],
-            &["protos"],
-        )?;
+        .compile_with_config(prost_config, &["protos/quickwit/search.proto"], &["protos"])?;
 
     // Jaeger proto
     let protos = find_protos("protos/third-party/jaeger");

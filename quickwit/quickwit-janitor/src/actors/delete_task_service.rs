@@ -19,7 +19,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,7 +26,13 @@ use quickwit_actors::{Actor, ActorContext, ActorExitStatus, ActorHandle, Handler
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::temp_dir::{self};
 use quickwit_config::IndexConfig;
-use quickwit_metastore::{ListIndexesQuery, Metastore};
+use quickwit_metastore::{
+    IndexMetadataResponseExt, ListIndexesMetadataRequestExt, ListIndexesQuery,
+    ListIndexesResponseExt,
+};
+use quickwit_proto::metastore::{
+    IndexMetadataRequest, ListIndexesMetadatasRequest, MetastoreService, MetastoreServiceClient,
+};
 use quickwit_proto::IndexUid;
 use quickwit_search::SearchJobPlacer;
 use quickwit_storage::StorageResolver;
@@ -52,7 +57,7 @@ pub struct DeleteTaskServiceState {
 }
 
 pub struct DeleteTaskService {
-    metastore: Arc<dyn Metastore>,
+    metastore: MetastoreServiceClient,
     search_job_placer: SearchJobPlacer,
     storage_resolver: StorageResolver,
     delete_service_task_dir: PathBuf,
@@ -63,7 +68,7 @@ pub struct DeleteTaskService {
 
 impl DeleteTaskService {
     pub async fn new(
-        metastore: Arc<dyn Metastore>,
+        metastore: MetastoreServiceClient,
         search_job_placer: SearchJobPlacer,
         storage_resolver: StorageResolver,
         data_dir_path: PathBuf,
@@ -110,10 +115,13 @@ impl DeleteTaskService {
         &mut self,
         ctx: &ActorContext<Self>,
     ) -> anyhow::Result<()> {
+        let list_indexes_metadata_request =
+            ListIndexesMetadatasRequest::try_from_list_indexes_query(ListIndexesQuery::All)?;
         let mut index_config_by_index_id: HashMap<IndexUid, IndexConfig> = self
             .metastore
-            .list_indexes_metadatas(ListIndexesQuery::All)
+            .list_indexes_metadatas(list_indexes_metadata_request)
             .await?
+            .deserialize_indexes_metadata()?
             .into_iter()
             .map(|index_metadata| {
                 (
@@ -163,10 +171,14 @@ impl DeleteTaskService {
     ) -> anyhow::Result<()> {
         let index_uri = index_config.index_uri.clone();
         let index_storage = self.storage_resolver.resolve(&index_uri).await?;
+        let index_metadata_request = IndexMetadataRequest {
+            index_id: index_config.index_id.clone(),
+        };
         let index_metadata = self
             .metastore
-            .index_metadata(index_config.index_id.as_str())
-            .await?;
+            .index_metadata(index_metadata_request)
+            .await?
+            .deserialize_index_metadata()?;
         let pipeline = DeleteTaskPipeline::new(
             index_metadata.index_uid.clone(),
             self.metastore.clone(),
@@ -209,7 +221,9 @@ impl Handler<UpdatePipelines> for DeleteTaskService {
 mod tests {
     use quickwit_common::pubsub::EventBroker;
     use quickwit_indexing::TestSandbox;
-    use quickwit_proto::metastore::DeleteQuery;
+    use quickwit_proto::metastore::{
+        DeleteIndexRequest, DeleteQuery, ListDeleteTasksRequest, MetastoreService,
+    };
     use quickwit_search::{searcher_pool_for_test, MockSearchService, SearchJobPlacer};
     use quickwit_storage::StorageResolver;
 
@@ -229,7 +243,7 @@ mod tests {
         "#;
         let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
         let index_uid = test_sandbox.index_uid();
-        let metastore = test_sandbox.metastore();
+        let mut metastore = test_sandbox.metastore();
         let mock_search_service = MockSearchService::new();
         let searcher_pool = searcher_pool_for_test([("127.0.0.1:1000", mock_search_service)]);
         let search_job_placer = SearchJobPlacer::new(searcher_pool);
@@ -263,13 +277,22 @@ mod tests {
         // Just test creation of delete query.
         assert_eq!(
             metastore
-                .list_delete_tasks(index_uid.clone(), 0)
+                .list_delete_tasks(ListDeleteTasksRequest {
+                    index_uid: index_uid.to_string(),
+                    opstamp_start: 0,
+                })
                 .await
                 .unwrap()
+                .delete_tasks
                 .len(),
             1
         );
-        metastore.delete_index(index_uid.clone()).await.unwrap();
+        metastore
+            .delete_index(DeleteIndexRequest {
+                index_uid: index_uid.to_string(),
+            })
+            .await
+            .unwrap();
         test_sandbox
             .universe()
             .sleep(UPDATE_PIPELINES_INTERVAL * 2)

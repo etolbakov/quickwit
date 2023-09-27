@@ -17,16 +17,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::sync::Arc;
-
 use anyhow::Context;
 use async_trait::async_trait;
 use quickwit_actors::{
     Actor, ActorContext, ActorExitStatus, ActorHandle, AskError, Handler, Mailbox, Universe,
 };
-use quickwit_config::{IndexConfig, SourceConfig};
+use quickwit_config::SourceConfig;
 use quickwit_ingest::IngesterPool;
-use quickwit_metastore::Metastore;
 use quickwit_proto::control_plane::{
     CloseShardsRequest, CloseShardsResponse, ControlPlaneError, ControlPlaneResult,
     GetOpenShardsRequest, GetOpenShardsResponse, NotifyIndexChangeRequest,
@@ -37,8 +34,8 @@ use quickwit_proto::metastore::events::{
 };
 use quickwit_proto::metastore::{
     serde_utils as metastore_serde_utils, AddSourceRequest, CreateIndexRequest,
-    CreateIndexResponse, DeleteIndexRequest, DeleteSourceRequest, EmptyResponse,
-    ToggleSourceRequest,
+    CreateIndexResponse, DeleteIndexRequest, DeleteSourceRequest, EmptyResponse, MetastoreService,
+    MetastoreServiceClient, ToggleSourceRequest,
 };
 use quickwit_proto::{IndexUid, NodeId};
 use tracing::debug;
@@ -49,7 +46,7 @@ use crate::IndexerPool;
 
 #[derive(Debug)]
 pub struct ControlPlane {
-    metastore: Arc<dyn Metastore>,
+    metastore: MetastoreServiceClient,
     // N.B.: The control plane is an actor and both the indexing scheduler and the ingest
     // controller are also actors. It might be simpler to have a single actor for the control
     // plane and replace message passing with function calls. The control plane would be in
@@ -67,7 +64,7 @@ impl ControlPlane {
         self_node_id: NodeId,
         indexer_pool: IndexerPool,
         ingester_pool: IngesterPool,
-        metastore: Arc<dyn Metastore>,
+        metastore: MetastoreServiceClient,
         replication_factor: usize,
     ) -> (Mailbox<Self>, ActorHandle<Self>) {
         let indexing_scheduler =
@@ -127,15 +124,8 @@ impl Handler<CreateIndexRequest> for ControlPlane {
         request: CreateIndexRequest,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        let index_config: IndexConfig =
-            match metastore_serde_utils::from_json_str(&request.index_config_json) {
-                Ok(index_config) => index_config,
-                Err(error) => {
-                    return Ok(Err(ControlPlaneError::from(error)));
-                }
-            };
-        let index_uid = match self.metastore.create_index(index_config).await {
-            Ok(index_uid) => index_uid,
+        let index_uid: IndexUid = match self.metastore.create_index(request).await {
+            Ok(response) => response.index_uid.into(),
             Err(error) => {
                 return Ok(Err(ControlPlaneError::from(error)));
             }
@@ -163,9 +153,9 @@ impl Handler<DeleteIndexRequest> for ControlPlane {
         request: DeleteIndexRequest,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        let index_uid: IndexUid = request.index_uid.into();
+        let index_uid: IndexUid = request.index_uid.clone().into();
 
-        if let Err(error) = self.metastore.delete_index(index_uid.clone()).await {
+        if let Err(error) = self.metastore.delete_index(request).await {
             return Ok(Err(ControlPlaneError::from(error)));
         };
         let event = DeleteIndexEvent { index_uid };
@@ -189,7 +179,7 @@ impl Handler<AddSourceRequest> for ControlPlane {
         request: AddSourceRequest,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        let index_uid: IndexUid = request.index_uid.into();
+        let index_uid: IndexUid = request.index_uid.clone().into();
         let source_config: SourceConfig =
             match metastore_serde_utils::from_json_str(&request.source_config_json) {
                 Ok(source_config) => source_config,
@@ -199,12 +189,7 @@ impl Handler<AddSourceRequest> for ControlPlane {
             };
         let source_id = source_config.source_id.clone();
         let source_type = source_config.source_type();
-
-        if let Err(error) = self
-            .metastore
-            .add_source(index_uid.clone(), source_config)
-            .await
-        {
+        if let Err(error) = self.metastore.add_source(request).await {
             return Ok(Err(ControlPlaneError::from(error)));
         };
         let event = AddSourceEvent {
@@ -231,19 +216,16 @@ impl Handler<ToggleSourceRequest> for ControlPlane {
         request: ToggleSourceRequest,
         _ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        let index_uid: IndexUid = request.index_uid.into();
-
-        if let Err(error) = self
-            .metastore
-            .toggle_source(index_uid.clone(), &request.source_id, request.enable)
-            .await
-        {
+        let index_uid: IndexUid = request.index_uid.clone().into();
+        let source_id = request.source_id.clone();
+        let enabled = request.enable;
+        if let Err(error) = self.metastore.toggle_source(request).await {
             return Ok(Err(ControlPlaneError::from(error)));
         };
         let _event = ToggleSourceEvent {
             index_uid,
-            source_id: request.source_id,
-            enabled: request.enable,
+            source_id,
+            enabled,
         };
         // TODO: Notify indexing controller.
         let response = EmptyResponse {};
@@ -260,18 +242,14 @@ impl Handler<DeleteSourceRequest> for ControlPlane {
         request: DeleteSourceRequest,
         _ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        let index_uid: IndexUid = request.index_uid.into();
-
-        if let Err(error) = self
-            .metastore
-            .delete_source(index_uid.clone(), &request.source_id)
-            .await
-        {
+        let index_uid: IndexUid = request.index_uid.clone().into();
+        let source_id = request.source_id.clone();
+        if let Err(error) = self.metastore.delete_source(request).await {
             return Ok(Err(ControlPlaneError::from(error)));
         };
         let _event = DeleteSourceEvent {
             index_uid,
-            source_id: request.source_id,
+            source_id,
         };
         // TODO: Notify indexing controller.
         let response = EmptyResponse {};
@@ -328,11 +306,14 @@ impl Handler<CloseShardsRequest> for ControlPlane {
 
 #[cfg(test)]
 mod tests {
-    use quickwit_config::{SourceParams, INGEST_SOURCE_ID};
-    use quickwit_metastore::{IndexMetadata, MockMetastore};
+    use quickwit_config::{IndexConfig, SourceParams, INGEST_SOURCE_ID};
+    use quickwit_metastore::{IndexMetadata, ListIndexesResponseExt};
     use quickwit_proto::control_plane::GetOpenShardsSubrequest;
     use quickwit_proto::ingest::Shard;
-    use quickwit_proto::metastore::{ListShardsResponse, ListShardsSubresponse, SourceType};
+    use quickwit_proto::metastore::{
+        ListIndexesMetadatasResponse, ListShardsResponse, ListShardsSubresponse,
+        MockMetastoreService, SourceType,
+    };
 
     use super::*;
 
@@ -345,20 +326,26 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
 
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_create_index()
-            .returning(|index_config| {
+            .withf(|create_index_request| {
+                let index_config: IndexConfig =
+                    serde_json::from_str(&create_index_request.index_config_json).unwrap();
                 assert_eq!(index_config.index_id, "test-index");
                 assert_eq!(index_config.index_uri, "ram:///test-index");
-
-                let index_uid: IndexUid = "test-index:0".into();
-                Ok(index_uid)
+                true
+            })
+            .returning(|_| {
+                Ok(CreateIndexResponse {
+                    index_uid: "test-index:0".to_string(),
+                })
             });
         mock_metastore
             .expect_list_indexes_metadatas()
-            .returning(|_| Ok(Vec::new()));
-        let metastore = Arc::new(mock_metastore);
+            .returning(|_| {
+                Ok(ListIndexesMetadatasResponse::try_from_indexes_metadata(Vec::new()).unwrap())
+            });
         let replication_factor = 1;
 
         let (control_plane_mailbox, _control_plane_handle) = ControlPlane::spawn(
@@ -367,7 +354,7 @@ mod tests {
             self_node_id,
             indexer_pool,
             ingester_pool,
-            metastore,
+            MetastoreServiceClient::new(mock_metastore),
             replication_factor,
         );
         let index_config = IndexConfig::for_test("test-index", "ram:///test-index");
@@ -394,15 +381,16 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
 
-        let mut mock_metastore = MockMetastore::default();
-        mock_metastore.expect_delete_index().returning(|index_uid| {
-            assert_eq!(index_uid.as_str(), "test-index:0");
-            Ok(())
-        });
+        let mut mock_metastore = MockMetastoreService::default();
+        mock_metastore
+            .expect_delete_index()
+            .withf(|delete_index_request| delete_index_request.index_uid == "test-index:0")
+            .returning(|_| Ok(EmptyResponse::default()));
         mock_metastore
             .expect_list_indexes_metadatas()
-            .returning(|_| Ok(Vec::new()));
-        let metastore = Arc::new(mock_metastore);
+            .returning(|_| {
+                Ok(ListIndexesMetadatasResponse::try_from_indexes_metadata(Vec::new()).unwrap())
+            });
         let replication_factor = 1;
 
         let (control_plane_mailbox, _control_plane_handle) = ControlPlane::spawn(
@@ -411,7 +399,7 @@ mod tests {
             self_node_id,
             indexer_pool,
             ingester_pool,
-            metastore,
+            MetastoreServiceClient::new(mock_metastore),
             replication_factor,
         );
         let delete_index_request = DeleteIndexRequest {
@@ -429,6 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_plane_add_source() {
+        quickwit_common::setup_logging_for_tests();
         let universe = Universe::with_accelerated_time();
 
         let cluster_id = "test-cluster".to_string();
@@ -436,19 +425,22 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
 
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_add_source()
-            .returning(|index_uid, source_config| {
-                assert_eq!(index_uid.as_str(), "test-index:0");
+            .withf(|add_source_request| {
+                let source_config: SourceConfig =
+                    serde_json::from_str(&add_source_request.source_config_json).unwrap();
                 assert_eq!(source_config.source_id, "test-source");
                 assert_eq!(source_config.source_type(), SourceType::Void);
-                Ok(())
-            });
+                true
+            })
+            .returning(|_| Ok(EmptyResponse::default()));
         mock_metastore
             .expect_list_indexes_metadatas()
-            .returning(|_| Ok(Vec::new()));
-        let metastore = Arc::new(mock_metastore);
+            .returning(|_| {
+                Ok(ListIndexesMetadatasResponse::try_from_indexes_metadata(Vec::new()).unwrap())
+            });
         let replication_factor = 1;
 
         let (control_plane_mailbox, _control_plane_handle) = ControlPlane::spawn(
@@ -457,7 +449,7 @@ mod tests {
             self_node_id,
             indexer_pool,
             ingester_pool,
-            metastore,
+            MetastoreServiceClient::new(mock_metastore),
             replication_factor,
         );
         let source_config = SourceConfig::for_test("test-source", SourceParams::void());
@@ -484,19 +476,21 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
 
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_toggle_source()
-            .returning(|index_uid, source_id, enable| {
-                assert_eq!(index_uid.as_str(), "test-index:0");
-                assert_eq!(source_id, "test-source");
-                assert!(enable);
-                Ok(())
-            });
+            .withf(|toggle_source_request| {
+                assert_eq!(toggle_source_request.index_uid, "test-index:0");
+                assert_eq!(toggle_source_request.source_id, "test-source");
+                assert!(toggle_source_request.enable);
+                true
+            })
+            .returning(|_| Ok(EmptyResponse::default()));
         mock_metastore
             .expect_list_indexes_metadatas()
-            .returning(|_| Ok(Vec::new()));
-        let metastore = Arc::new(mock_metastore);
+            .returning(|_| {
+                Ok(ListIndexesMetadatasResponse::try_from_indexes_metadata(Vec::new()).unwrap())
+            });
         let replication_factor = 1;
 
         let (control_plane_mailbox, _control_plane_handle) = ControlPlane::spawn(
@@ -505,7 +499,7 @@ mod tests {
             self_node_id,
             indexer_pool,
             ingester_pool,
-            metastore,
+            MetastoreServiceClient::new(mock_metastore),
             replication_factor,
         );
         let toggle_source_request = ToggleSourceRequest {
@@ -532,18 +526,20 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
 
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_delete_source()
-            .returning(|index_uid, source_id| {
-                assert_eq!(index_uid.as_str(), "test-index:0");
-                assert_eq!(source_id, "test-source");
-                Ok(())
-            });
+            .withf(|delete_source_request| {
+                assert_eq!(delete_source_request.index_uid, "test-index:0");
+                assert_eq!(delete_source_request.source_id, "test-source");
+                true
+            })
+            .returning(|_| Ok(EmptyResponse::default()));
         mock_metastore
             .expect_list_indexes_metadatas()
-            .returning(|_| Ok(Vec::new()));
-        let metastore = Arc::new(mock_metastore);
+            .returning(|_| {
+                Ok(ListIndexesMetadatasResponse::try_from_indexes_metadata(Vec::new()).unwrap())
+            });
         let replication_factor = 1;
 
         let (control_plane_mailbox, _control_plane_handle) = ControlPlane::spawn(
@@ -552,7 +548,7 @@ mod tests {
             self_node_id,
             indexer_pool,
             ingester_pool,
-            metastore,
+            MetastoreServiceClient::new(mock_metastore),
             replication_factor,
         );
         let delete_source_request = DeleteSourceRequest {
@@ -578,14 +574,17 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
 
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_list_indexes_metadatas()
             .returning(|_| {
                 let mut index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
                 let source_config = SourceConfig::for_test(INGEST_SOURCE_ID, SourceParams::void());
                 index_metadata.add_source(source_config).unwrap();
-                Ok(vec![index_metadata])
+                Ok(
+                    ListIndexesMetadatasResponse::try_from_indexes_metadata(vec![index_metadata])
+                        .unwrap(),
+                )
             });
         mock_metastore.expect_list_shards().returning(|request| {
             assert_eq!(request.subrequests.len(), 1);
@@ -608,7 +607,6 @@ mod tests {
             let response = ListShardsResponse { subresponses };
             Ok(response)
         });
-        let metastore = Arc::new(mock_metastore);
         let replication_factor = 1;
 
         let (control_plane_mailbox, _control_plane_handle) = ControlPlane::spawn(
@@ -617,7 +615,7 @@ mod tests {
             self_node_id,
             indexer_pool,
             ingester_pool,
-            metastore,
+            MetastoreServiceClient::new(mock_metastore),
             replication_factor,
         );
         let get_open_shards_request = GetOpenShardsRequest {

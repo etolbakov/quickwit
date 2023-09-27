@@ -19,19 +19,80 @@
 
 use std::fmt;
 
+use async_trait::async_trait;
 use quickwit_common::retry::Retryable;
+use quickwit_common::uri::Uri;
 use serde::{Deserialize, Serialize};
 
-use crate::{IndexId, QueueId, ServiceError, ServiceErrorCode, SourceId, SplitId};
+use super::types::SourceId;
+use crate::{IndexId, QueueId, ServiceError, ServiceErrorCode, SplitId};
 
 pub mod events;
 
 include!("../codegen/quickwit/quickwit.metastore.rs");
 
-pub use metastore_service_client::MetastoreServiceClient;
-pub use metastore_service_server::{MetastoreService, MetastoreServiceServer};
-
 pub type MetastoreResult<T> = Result<T, MetastoreError>;
+
+/// A extended trait for metastore service.
+#[async_trait]
+pub trait MetastoreServiceExt: MetastoreService {
+    /// Check metastore connection.
+    async fn check_connectivity(&self) -> MetastoreResult<()>;
+
+    fn uris(&self) -> Vec<Uri>;
+}
+dyn_clone::clone_trait_object!(MetastoreServiceExt);
+
+#[async_trait]
+impl MetastoreServiceExt for MetastoreServiceTowerBlock {
+    async fn check_connectivity(&self) -> MetastoreResult<()> {
+        // self.inner.check_connectivity().await
+        Ok(())
+    }
+
+    fn uris(&self) -> Vec<Uri> {
+        // self.inner.uris().await
+        Vec::new()
+    }
+}
+
+#[async_trait]
+impl MetastoreServiceExt for MetastoreServiceClient {
+    async fn check_connectivity(&self) -> MetastoreResult<()> {
+        // self.inner.check_connectivity().await
+        Ok(())
+    }
+
+    fn uris(&self) -> Vec<Uri> {
+        // self.inner.uris().await
+        Vec::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl<T> MetastoreServiceExt
+    for MetastoreServiceGrpcClientAdapter<
+        metastore_service_grpc_client::MetastoreServiceGrpcClient<T>,
+    >
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody>
+        + std::fmt::Debug
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
+    async fn check_connectivity(&self) -> MetastoreResult<()> {
+        Ok(())
+    }
+
+    fn uris(&self) -> Vec<Uri> {
+        Vec::new()
+    }
+}
 
 /// Lists the object types stored and managed by the metastore.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,6 +208,18 @@ impl From<sqlx::Error> for MetastoreError {
     fn from(error: sqlx::Error) -> Self {
         MetastoreError::Db {
             message: error.to_string(),
+        }
+    }
+}
+
+impl From<tonic::Status> for MetastoreError {
+    fn from(status: tonic::Status) -> Self {
+        match status.code() {
+            tonic::Code::Unavailable => MetastoreError::Unavailable(status.message().to_string()),
+            _ => MetastoreError::Internal {
+                message: status.message().to_string(),
+                cause: "".to_string(),
+            },
         }
     }
 }

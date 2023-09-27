@@ -28,11 +28,12 @@ use itertools::Itertools;
 use quickwit_actors::{ActorExitStatus, Mailbox};
 use quickwit_ingest::{IngesterPool, MultiFetchStream};
 use quickwit_metastore::checkpoint::{PartitionId, Position, SourceCheckpoint};
-use quickwit_metastore::Metastore;
 use quickwit_proto::ingest::ingester::{
     FetchResponseV2, IngesterService, TruncateRequest, TruncateSubrequest,
 };
-use quickwit_proto::metastore::{AcquireShardsRequest, AcquireShardsSubrequest};
+use quickwit_proto::metastore::{
+    AcquireShardsRequest, AcquireShardsSubrequest, MetastoreService, MetastoreServiceClient,
+};
 use quickwit_proto::types::NodeId;
 use quickwit_proto::{IndexUid, PublishToken, ShardId, SourceId};
 use serde_json::json;
@@ -103,7 +104,7 @@ struct AssignedShard {
 /// Streams documents from a set of shards.
 pub struct IngestSource {
     client_id: ClientId,
-    metastore: Arc<dyn Metastore>,
+    metastore: MetastoreServiceClient,
     ingester_pool: IngesterPool,
     assigned_shards: HashMap<ShardId, AssignedShard>,
     fetch_stream: MultiFetchStream,
@@ -422,11 +423,12 @@ mod tests {
     use quickwit_actors::{ActorContext, Universe};
     use quickwit_common::ServiceStream;
     use quickwit_config::{SourceConfig, SourceParams};
-    use quickwit_metastore::MockMetastore;
     use quickwit_proto::indexing::IndexingPipelineId;
     use quickwit_proto::ingest::ingester::{IngesterServiceClient, TruncateResponse};
     use quickwit_proto::ingest::{DocBatchV2, Shard};
-    use quickwit_proto::metastore::{AcquireShardsResponse, AcquireShardsSubresponse};
+    use quickwit_proto::metastore::{
+        AcquireShardsResponse, AcquireShardsSubresponse, MockMetastoreService,
+    };
     use tokio::sync::watch;
 
     use super::*;
@@ -442,7 +444,7 @@ mod tests {
             pipeline_ord: 0,
         };
         let source_config = SourceConfig::for_test("test-source", SourceParams::Ingest);
-        let mut mock_metastore = MockMetastore::default();
+        let mut mock_metastore = MockMetastoreService::default();
         mock_metastore
             .expect_acquire_shards()
             .once()
@@ -482,8 +484,6 @@ mod tests {
                 };
                 Ok(response)
             });
-        let metastore = Arc::new(mock_metastore);
-
         let ingester_pool = IngesterPool::default();
 
         let mut ingester_mock_0 = IngesterServiceClient::mock();
@@ -528,7 +528,7 @@ mod tests {
         let runtime_args = Arc::new(SourceRuntimeArgs {
             pipeline_id,
             source_config,
-            metastore,
+            metastore: MetastoreServiceClient::new(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
         });
@@ -598,14 +598,13 @@ mod tests {
             pipeline_ord: 0,
         };
         let source_config = SourceConfig::for_test("test-source", SourceParams::Ingest);
-        let mock_metastore = MockMetastore::default();
-        let metastore = Arc::new(mock_metastore);
+        let mock_metastore = MockMetastoreService::default();
         let ingester_pool = IngesterPool::default();
 
         let runtime_args = Arc::new(SourceRuntimeArgs {
             pipeline_id,
             source_config,
-            metastore,
+            metastore: MetastoreServiceClient::new(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
         });
@@ -707,8 +706,7 @@ mod tests {
             pipeline_ord: 0,
         };
         let source_config = SourceConfig::for_test("test-source", SourceParams::Ingest);
-        let mock_metastore = MockMetastore::default();
-        let metastore = Arc::new(mock_metastore);
+        let mock_metastore = MockMetastoreService::default();
 
         let ingester_pool = IngesterPool::default();
 
@@ -757,7 +755,7 @@ mod tests {
         let runtime_args = Arc::new(SourceRuntimeArgs {
             pipeline_id,
             source_config,
-            metastore,
+            metastore: MetastoreServiceClient::new(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
         });
