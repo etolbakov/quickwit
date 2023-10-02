@@ -184,6 +184,9 @@ impl IngestSource {
             HashMap::new();
 
         for (shard_id, truncate_position) in truncation_point {
+            if matches!(truncate_position, Position::Beginning) {
+                continue;
+            }
             let Some(leader_id) = self
                 .assigned_shards
                 .get(shard_id)
@@ -211,7 +214,7 @@ impl IngestSource {
                 .push(truncate_subrequest);
         }
         for (leader_id, truncate_subrequests) in per_leader_truncate_subrequests {
-            let Some(mut ingester) = self.ingester_pool.get(leader_id).await else {
+            let Some(mut ingester) = self.ingester_pool.get(leader_id) else {
                 warn!(
                     "failed to truncate shard: ingester `{}` is unavailable",
                     leader_id
@@ -521,9 +524,7 @@ mod tests {
             });
 
         let ingester_0: IngesterServiceClient = ingester_mock_0.into();
-        ingester_pool
-            .insert("test-ingester-0".into(), ingester_0.clone())
-            .await;
+        ingester_pool.insert("test-ingester-0".into(), ingester_0.clone());
 
         let runtime_args = Arc::new(SourceRuntimeArgs {
             pipeline_id,
@@ -731,9 +732,7 @@ mod tests {
                 Ok(TruncateResponse {})
             });
         let ingester_0: IngesterServiceClient = ingester_mock_0.into();
-        ingester_pool
-            .insert("test-ingester-0".into(), ingester_0.clone())
-            .await;
+        ingester_pool.insert("test-ingester-0".into(), ingester_0.clone());
 
         let mut ingester_mock_1 = IngesterServiceClient::mock();
         ingester_mock_1
@@ -750,9 +749,7 @@ mod tests {
                 Ok(TruncateResponse {})
             });
         let ingester_1: IngesterServiceClient = ingester_mock_1.into();
-        ingester_pool
-            .insert("test-ingester-1".into(), ingester_1.clone())
-            .await;
+        ingester_pool.insert("test-ingester-1".into(), ingester_1.clone());
 
         let runtime_args = Arc::new(SourceRuntimeArgs {
             pipeline_id,

@@ -27,6 +27,7 @@ mod health_check_api;
 mod index_api;
 mod indexing_api;
 mod ingest_api;
+mod ingest_metastore;
 mod json_api_response;
 mod metrics;
 mod metrics_api;
@@ -51,6 +52,7 @@ use anyhow::Context;
 use byte_unit::n_mib_bytes;
 pub use format::BodyFormat;
 use futures::{Stream, StreamExt};
+use ingest_metastore::IngestMetastore;
 use itertools::Itertools;
 use quickwit_actors::{ActorExitStatus, Mailbox, Universe};
 use quickwit_cluster::{start_cluster_service, Cluster, ClusterChange, ClusterMember};
@@ -361,6 +363,7 @@ pub async fn serve_quickwit(
     let (ingest_router_service, ingester_service_opt) = setup_ingest_v2(
         &node_config,
         &cluster,
+        metastore_client.clone(),
         control_plane_service.clone(),
         ingester_pool,
     )
@@ -581,6 +584,7 @@ fn setup_control_plane_event_subscriptions(
 async fn setup_ingest_v2(
     config: &NodeConfig,
     cluster: &Cluster,
+    metastore: Arc<dyn Metastore>,
     control_plane: ControlPlaneServiceClient,
     ingester_pool: IngesterPool,
 ) -> anyhow::Result<(IngestRouterServiceClient, Option<IngesterServiceClient>)> {
@@ -606,6 +610,7 @@ async fn setup_ingest_v2(
 
         let ingester = Ingester::try_new(
             self_node_id.clone(),
+            Arc::new(IngestMetastore::new(metastore)),
             ingester_pool.clone(),
             &wal_dir_path,
             replication_factor,
@@ -961,9 +966,9 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(1)).await;
 
-        assert_eq!(indexer_pool.len().await, 1);
+        assert_eq!(indexer_pool.len(), 1);
 
-        let new_indexer_node_info = indexer_pool.get("test-indexer-node").await.unwrap();
+        let new_indexer_node_info = indexer_pool.get("test-indexer-node").unwrap();
         assert!(new_indexer_node_info.indexing_tasks.is_empty());
 
         let new_indexing_task = IndexingTask {
@@ -985,7 +990,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(1)).await;
 
-        let updated_indexer_node_info = indexer_pool.get("test-indexer-node").await.unwrap();
+        let updated_indexer_node_info = indexer_pool.get("test-indexer-node").unwrap();
         assert_eq!(updated_indexer_node_info.indexing_tasks.len(), 1);
         assert_eq!(
             updated_indexer_node_info.indexing_tasks[0],
@@ -998,7 +1003,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(1)).await;
 
-        assert!(indexer_pool.is_empty().await);
+        assert!(indexer_pool.is_empty());
     }
 
     #[tokio::test]

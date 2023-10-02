@@ -168,7 +168,7 @@ impl IndexingScheduler {
     }
 
     async fn schedule_indexing_plan_if_needed(&mut self) -> anyhow::Result<()> {
-        let mut indexers = self.get_indexers_from_indexer_pool().await;
+        let mut indexers = self.get_indexers_from_indexer_pool();
         if indexers.is_empty() {
             warn!("No indexer available, cannot schedule an indexing plan.");
             return Ok(());
@@ -303,7 +303,7 @@ impl IndexingScheduler {
             }
         }
 
-        let mut indexers = self.get_indexers_from_indexer_pool().await;
+        let mut indexers = self.get_indexers_from_indexer_pool();
         let running_indexing_tasks_by_node_id: HashMap<String, Vec<IndexingTask>> = indexers
             .iter()
             .map(|indexer| (indexer.0.clone(), indexer.1.indexing_tasks.clone()))
@@ -325,8 +325,8 @@ impl IndexingScheduler {
         Ok(())
     }
 
-    async fn get_indexers_from_indexer_pool(&self) -> Vec<(String, IndexerNodeInfo)> {
-        self.indexer_pool.all().await
+    fn get_indexers_from_indexer_pool(&self) -> Vec<(String, IndexerNodeInfo)> {
+        self.indexer_pool.pairs().collect()
     }
 
     async fn apply_physical_indexing_plan(

@@ -32,7 +32,7 @@ use quickwit_proto::indexing::{IndexingServiceClient, IndexingTask};
 use quickwit_proto::metastore::events::{
     AddSourceEvent, CreateIndexEvent, DeleteIndexEvent, DeleteSourceEvent, ToggleSourceEvent,
 };
-use quickwit_proto::metastore::SourceType;
+use quickwit_proto::metastore::{CloseShardsRequest, DeleteShardsRequest, SourceType};
 use tracing::error;
 
 /// Indexer-node specific information stored in the pool of available indexer nodes
@@ -109,6 +109,30 @@ impl EventSubscriber<ToggleSourceEvent> for ControlPlaneEventSubscriber {
 impl EventSubscriber<DeleteSourceEvent> for ControlPlaneEventSubscriber {
     async fn handle_event(&mut self, _event: DeleteSourceEvent) {
         self.notify_index_change("delete-source").await;
+    }
+}
+
+#[async_trait]
+impl EventSubscriber<CloseShardsRequest> for ControlPlaneEventSubscriber {
+    async fn handle_event(&mut self, request: CloseShardsRequest) {
+        if let Err(error) = self.0.close_shards(request).await {
+            error!(
+                "failed to notify control plane of close shards event: `{}`",
+                error
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl EventSubscriber<DeleteShardsRequest> for ControlPlaneEventSubscriber {
+    async fn handle_event(&mut self, request: DeleteShardsRequest) {
+        if let Err(error) = self.0.delete_shards(request).await {
+            error!(
+                "failed to notify control plane of delete shards event: `{}`",
+                error
+            );
+        }
     }
 }
 

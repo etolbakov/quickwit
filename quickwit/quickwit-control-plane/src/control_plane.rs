@@ -28,17 +28,16 @@ use quickwit_config::{IndexConfig, SourceConfig};
 use quickwit_ingest::IngesterPool;
 use quickwit_metastore::Metastore;
 use quickwit_proto::control_plane::{
-    CloseShardsRequest, CloseShardsResponse, ControlPlaneError, ControlPlaneResult,
-    GetOpenShardsRequest, GetOpenShardsResponse, NotifyIndexChangeRequest,
-    NotifyIndexChangeResponse,
+    ControlPlaneError, ControlPlaneResult, GetOrCreateOpenShardsRequest,
+    GetOrCreateOpenShardsResponse, NotifyIndexChangeRequest, NotifyIndexChangeResponse,
 };
 use quickwit_proto::metastore::events::{
     AddSourceEvent, CreateIndexEvent, DeleteIndexEvent, DeleteSourceEvent, ToggleSourceEvent,
 };
 use quickwit_proto::metastore::{
-    serde_utils as metastore_serde_utils, AddSourceRequest, CreateIndexRequest,
-    CreateIndexResponse, DeleteIndexRequest, DeleteSourceRequest, EmptyResponse,
-    ToggleSourceRequest,
+    serde_utils as metastore_serde_utils, AddSourceRequest, CloseShardsRequest, CreateIndexRequest,
+    CreateIndexResponse, DeleteIndexRequest, DeleteShardsRequest, DeleteSourceRequest,
+    EmptyResponse, ToggleSourceRequest,
 };
 use quickwit_proto::{IndexUid, NodeId};
 use tracing::debug;
@@ -299,12 +298,12 @@ impl Handler<NotifyIndexChangeRequest> for ControlPlane {
 }
 
 #[async_trait]
-impl Handler<GetOpenShardsRequest> for ControlPlane {
-    type Reply = ControlPlaneResult<GetOpenShardsResponse>;
+impl Handler<GetOrCreateOpenShardsRequest> for ControlPlane {
+    type Reply = ControlPlaneResult<GetOrCreateOpenShardsResponse>;
 
     async fn handle(
         &mut self,
-        request: GetOpenShardsRequest,
+        request: GetOrCreateOpenShardsRequest,
         _: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
         let response = handle_ask_res!(self.ingest_controller_mailbox.ask_for_res(request).await);
@@ -314,7 +313,7 @@ impl Handler<GetOpenShardsRequest> for ControlPlane {
 
 #[async_trait]
 impl Handler<CloseShardsRequest> for ControlPlane {
-    type Reply = ControlPlaneResult<CloseShardsResponse>;
+    type Reply = ControlPlaneResult<EmptyResponse>;
 
     async fn handle(
         &mut self,
@@ -326,11 +325,25 @@ impl Handler<CloseShardsRequest> for ControlPlane {
     }
 }
 
+#[async_trait]
+impl Handler<DeleteShardsRequest> for ControlPlane {
+    type Reply = ControlPlaneResult<EmptyResponse>;
+
+    async fn handle(
+        &mut self,
+        request: DeleteShardsRequest,
+        _: &ActorContext<Self>,
+    ) -> Result<Self::Reply, ActorExitStatus> {
+        let response = handle_ask_res!(self.ingest_controller_mailbox.ask_for_res(request).await);
+        Ok(Ok(response))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use quickwit_config::{SourceParams, INGEST_SOURCE_ID};
     use quickwit_metastore::{IndexMetadata, MockMetastore};
-    use quickwit_proto::control_plane::GetOpenShardsSubrequest;
+    use quickwit_proto::control_plane::GetOrCreateOpenShardsSubrequest;
     use quickwit_proto::ingest::Shard;
     use quickwit_proto::metastore::{ListShardsResponse, ListShardsSubresponse, SourceType};
 
@@ -620,10 +633,11 @@ mod tests {
             metastore,
             replication_factor,
         );
-        let get_open_shards_request = GetOpenShardsRequest {
-            subrequests: vec![GetOpenShardsSubrequest {
+        let get_open_shards_request = GetOrCreateOpenShardsRequest {
+            subrequests: vec![GetOrCreateOpenShardsSubrequest {
                 index_id: "test-index".to_string(),
                 source_id: INGEST_SOURCE_ID.to_string(),
+                closed_shards: Vec::new(),
             }],
             unavailable_ingesters: Vec::new(),
         };
