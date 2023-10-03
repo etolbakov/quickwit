@@ -39,7 +39,6 @@ use quickwit_proto::ingest::ingester::{
     OpenReplicationStreamResponse, PersistFailure, PersistFailureKind, PersistRequest,
     PersistResponse, PersistSuccess, PingRequest, PingResponse, ReplicateRequest,
     ReplicateSubrequest, SynReplicationMessage, TruncateRequest, TruncateResponse,
-    TruncateSubrequest,
 };
 use quickwit_proto::ingest::{CommitTypeV2, IngestV2Error, IngestV2Result, ShardState};
 use quickwit_proto::metastore::{
@@ -211,7 +210,7 @@ impl Ingester {
                 state.primary_shards.insert(queue_id, primary_shard);
             } else {
                 let replica_shard = ReplicaShard {
-                    leader_id: success.leader_id.into(),
+                    _leader_id: success.leader_id.into(),
                     shard_state: ShardState::Closed,
                     publish_position_inclusive,
                     replica_position_inclusive: current_position,
@@ -531,7 +530,6 @@ impl IngesterService for Ingester {
         let replication_task_handle = ReplicationTask::spawn(
             leader_id,
             follower_id,
-            self.metastore.clone(),
             self.mrecordlog.clone(),
             self.state.clone(),
             syn_replication_stream,
@@ -586,17 +584,15 @@ impl IngesterService for Ingester {
         &mut self,
         truncate_request: TruncateRequest,
     ) -> IngestV2Result<TruncateResponse> {
-        if truncate_request.leader_id != self.self_node_id {
+        if truncate_request.ingester_id != self.self_node_id {
             return Err(IngestV2Error::Internal(format!(
                 "routing error: expected ingester `{}`, got `{}`",
-                truncate_request.leader_id, self.self_node_id
+                self.self_node_id, truncate_request.ingester_id,
             )));
         }
         let mut gc_candidates: Vec<QueueId> = Vec::new();
         let mut mrecordlog_guard = self.mrecordlog.write().await;
         let mut state_guard = self.state.write().await;
-
-        let mut truncate_subrequests: HashMap<NodeId, Vec<TruncateSubrequest>> = HashMap::new();
 
         for subrequest in truncate_request.subrequests {
             let queue_id = subrequest.queue_id();
@@ -613,40 +609,24 @@ impl IngesterService for Ingester {
                 if primary_shard.is_gc_candidate() {
                     gc_candidates.push(queue_id.clone());
                 }
+                continue;
             }
-            if let Some(replica_shard) = state_guard.replica_shards.get(&queue_id) {
-                truncate_subrequests
-                    .entry(replica_shard.leader_id.clone())
-                    .or_default()
-                    .push(subrequest);
-            }
-        }
-        let mut truncate_futures = FuturesUnordered::new();
+            if let Some(replica_shard) = state_guard.replica_shards.get_mut(&queue_id) {
+                mrecordlog_guard
+                    .truncate(&queue_id, subrequest.to_position_inclusive)
+                    .await
+                    .map_err(|error| {
+                        IngestV2Error::Internal(format!("failed to truncate queue: {error:?}"))
+                    })?;
+                replica_shard.set_publish_position_inclusive(subrequest.to_position_inclusive);
 
-        for (follower_id, subrequests) in truncate_subrequests {
-            let leader_id = self.self_node_id.clone().into();
-            let truncate_request = TruncateRequest {
-                leader_id,
-                subrequests,
-            };
-            let replication_client = state_guard
-                .replication_clients
-                .get(&follower_id)
-                .expect("The replication client should be initialized.")
-                .clone();
-            truncate_futures
-                .push(async move { replication_client.truncate(truncate_request).await });
+                if replica_shard.is_gc_candidate() {
+                    gc_candidates.push(queue_id.clone());
+                }
+            }
         }
-        // Drop the write lock AFTER pushing the replicate request into the replication client
-        // channel to ensure that sequential writes in mrecordlog turn into sequential replicate
-        // requests in the same order.
         drop(state_guard);
 
-        while let Some(truncate_result) = truncate_futures.next().await {
-            // TODO: Handle errors.
-            truncate_result?;
-        }
-        // TODO: Update publish positions of truncated shards and then delete them when
         let truncate_response = TruncateResponse {};
         Ok(truncate_response)
     }
@@ -667,6 +647,7 @@ mod tests {
 
     use quickwit_proto::ingest::ingester::{
         IngesterServiceGrpcServer, IngesterServiceGrpcServerAdapter, PersistSubrequest,
+        TruncateSubrequest,
     };
     use quickwit_proto::ingest::DocBatchV2;
     use quickwit_proto::metastore::{
@@ -1406,7 +1387,7 @@ mod tests {
         drop(mrecordlog_guard);
 
         let truncate_request = TruncateRequest {
-            leader_id: self_node_id.to_string(),
+            ingester_id: self_node_id.to_string(),
             subrequests: vec![
                 TruncateSubrequest {
                     index_uid: "test-index:0".to_string(),
