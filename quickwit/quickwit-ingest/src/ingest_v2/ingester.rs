@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use mrecordlog::error::DeleteQueueError;
+use mrecordlog::error::{DeleteQueueError, TruncateError};
 use mrecordlog::MultiRecordLog;
 use quickwit_common::tower::Pool;
 use quickwit_common::ServiceStream;
@@ -65,9 +65,6 @@ pub struct Ingester {
     self_node_id: NodeId,
     metastore: Arc<dyn IngestMetastore>,
     ingester_pool: IngesterPool,
-    // TODO: There are a few places where we grab the two locks simultaneously. This will cause a
-    // deadlock. Let's fold `mrecordlog` into `IngesterState`.
-    mrecordlog: Arc<RwLock<MultiRecordLog>>,
     state: Arc<RwLock<IngesterState>>,
     replication_factor: usize,
 }
@@ -81,6 +78,7 @@ impl fmt::Debug for Ingester {
 }
 
 pub(super) struct IngesterState {
+    pub mrecordlog: MultiRecordLog,
     pub primary_shards: HashMap<QueueId, PrimaryShard>,
     pub replica_shards: HashMap<QueueId, ReplicaShard>,
     pub replication_clients: HashMap<NodeId, ReplicationClient>,
@@ -113,9 +111,9 @@ impl Ingester {
         )
         .await
         .map_err(|error| IngestV2Error::Internal(error.to_string()))?;
-        let mrecordlog = Arc::new(RwLock::new(mrecordlog));
 
         let inner = IngesterState {
+            mrecordlog,
             primary_shards: HashMap::new(),
             replica_shards: HashMap::new(),
             replication_clients: HashMap::new(),
@@ -125,7 +123,6 @@ impl Ingester {
             self_node_id,
             metastore,
             ingester_pool,
-            mrecordlog,
             state: Arc::new(RwLock::new(inner)),
             replication_factor,
         };
@@ -140,15 +137,13 @@ impl Ingester {
     }
 
     async fn init(&mut self) -> IngestV2Result<()> {
-        let mut mrecordlog_guard = self.mrecordlog.write().await;
-        let mut state = self.state.write().await;
-
-        let queue_ids = mrecordlog_guard.list_queues();
+        let mut state_guard = self.state.write().await;
 
         let mut subrequests = Vec::new();
 
-        for queue_id in queue_ids {
-            let current_position = mrecordlog_guard
+        for queue_id in state_guard.mrecordlog.list_queues() {
+            let current_position = state_guard
+                .mrecordlog
                 .current_position(queue_id)
                 .expect("queue should exist");
 
@@ -178,12 +173,14 @@ impl Ingester {
             let publish_position_inclusive: Position = success.publish_position_inclusive.into();
 
             if let Some(truncate_position) = publish_position_inclusive.offset() {
-                mrecordlog_guard
+                state_guard
+                    .mrecordlog
                     .truncate(&queue_id, truncate_position)
                     .await
                     .expect("queue should exist");
             }
-            let current_position: Position = mrecordlog_guard
+            let current_position: Position = state_guard
+                .mrecordlog
                 .current_position(&queue_id)
                 .expect("queue should exist")
                 .into();
@@ -207,7 +204,7 @@ impl Ingester {
                     shard_status_tx,
                     shard_status_rx,
                 };
-                state.primary_shards.insert(queue_id, primary_shard);
+                state_guard.primary_shards.insert(queue_id, primary_shard);
             } else {
                 let replica_shard = ReplicaShard {
                     _leader_id: success.leader_id.into(),
@@ -217,7 +214,7 @@ impl Ingester {
                     shard_status_tx,
                     shard_status_rx,
                 };
-                state.replica_shards.insert(queue_id, replica_shard);
+                state_guard.replica_shards.insert(queue_id, replica_shard);
             }
         }
         for failure in close_shards_response.failures {
@@ -225,7 +222,7 @@ impl Ingester {
                 let queue_id = failure.queue_id();
 
                 if let Err(DeleteQueueError::IoError(error)) =
-                    mrecordlog_guard.delete_queue(&queue_id).await
+                    state_guard.mrecordlog.delete_queue(&queue_id).await
                 {
                     error!("failed to delete mrecordlog queue: {}", error);
                 }
@@ -234,12 +231,7 @@ impl Ingester {
         if gc_candidates.is_empty() {
             return Ok(());
         }
-        GcTask::spawn(
-            self.metastore.clone(),
-            self.mrecordlog.clone(),
-            self.state.clone(),
-            gc_candidates,
-        );
+        GcTask::spawn(self.metastore.clone(), self.state.clone(), gc_candidates);
         Ok(())
     }
 
@@ -250,15 +242,11 @@ impl Ingester {
         leader_id: &NodeId,
         follower_id_opt: Option<&NodeId>,
     ) -> IngestV2Result<&'a PrimaryShard> {
-        let mut mrecordlog_guard = self.mrecordlog.write().await;
-
-        if !mrecordlog_guard.queue_exists(queue_id) {
-            mrecordlog_guard.create_queue(queue_id).await.expect("TODO"); // IO error, what to do?
+        if !state.mrecordlog.queue_exists(queue_id) {
+            state.mrecordlog.create_queue(queue_id).await.expect("TODO"); // IO error, what to do?
         } else {
             // TODO: Recover last position from mrecordlog and take it from there.
         }
-        drop(mrecordlog_guard);
-
         if let Some(follower_id) = follower_id_opt {
             self.init_replication_client(state, leader_id, follower_id)
                 .await?;
@@ -382,17 +370,17 @@ impl IngesterService for Ingester {
                 persist_successes.push(persist_success);
                 continue;
             };
-            let mut mrecordlog_guard = self.mrecordlog.write().await;
-
             let primary_position_inclusive = if force_commit {
                 let docs = doc_batch.docs().chain(once(commit_doc()));
-                mrecordlog_guard
+                state_guard
+                    .mrecordlog
                     .append_records(&queue_id, None, docs)
                     .await
                     .expect("TODO") // TODO: Io error, close shard?
             } else {
                 let docs = doc_batch.docs();
-                mrecordlog_guard
+                state_guard
+                    .mrecordlog
                     .append_records(&queue_id, None, docs)
                     .await
                     .expect("TODO") // TODO: Io error, close shard?
@@ -530,7 +518,6 @@ impl IngesterService for Ingester {
         let replication_task_handle = ReplicationTask::spawn(
             leader_id,
             follower_id,
-            self.mrecordlog.clone(),
             self.state.clone(),
             syn_replication_stream,
             ack_replication_stream_tx,
@@ -543,7 +530,7 @@ impl IngesterService for Ingester {
         &mut self,
         open_fetch_stream_request: OpenFetchStreamRequest,
     ) -> IngestV2Result<ServiceStream<IngestV2Result<FetchResponseV2>>> {
-        let mrecordlog = self.mrecordlog.clone();
+        let state = self.state.clone();
         let queue_id = open_fetch_stream_request.queue_id();
         let shard_status_rx = self
             .state
@@ -553,7 +540,7 @@ impl IngesterService for Ingester {
             .ok_or_else(|| IngestV2Error::Internal("shard not found".to_string()))?;
         let (service_stream, _fetch_task_handle) = FetchTask::spawn(
             open_fetch_stream_request,
-            mrecordlog,
+            state,
             shard_status_rx,
             FetchTask::DEFAULT_BATCH_NUM_BYTES,
         );
@@ -591,19 +578,23 @@ impl IngesterService for Ingester {
             )));
         }
         let mut gc_candidates: Vec<QueueId> = Vec::new();
-        let mut mrecordlog_guard = self.mrecordlog.write().await;
         let mut state_guard = self.state.write().await;
 
         for subrequest in truncate_request.subrequests {
             let queue_id = subrequest.queue_id();
 
+            match state_guard
+                .mrecordlog
+                .truncate(&queue_id, subrequest.to_position_inclusive)
+                .await
+            {
+                Ok(_) | Err(TruncateError::MissingQueue(_)) => {}
+                Err(error) => {
+                    error!("failed to truncate queue `{}`: {}", queue_id, error);
+                    continue;
+                }
+            }
             if let Some(primary_shard) = state_guard.primary_shards.get_mut(&queue_id) {
-                mrecordlog_guard
-                    .truncate(&queue_id, subrequest.to_position_inclusive)
-                    .await
-                    .map_err(|error| {
-                        IngestV2Error::Internal(format!("failed to truncate queue: {error:?}"))
-                    })?;
                 primary_shard.set_publish_position_inclusive(subrequest.to_position_inclusive);
 
                 if primary_shard.is_gc_candidate() {
@@ -612,12 +603,6 @@ impl IngesterService for Ingester {
                 continue;
             }
             if let Some(replica_shard) = state_guard.replica_shards.get_mut(&queue_id) {
-                mrecordlog_guard
-                    .truncate(&queue_id, subrequest.to_position_inclusive)
-                    .await
-                    .map_err(|error| {
-                        IngestV2Error::Internal(format!("failed to truncate queue: {error:?}"))
-                    })?;
                 replica_shard.set_publish_position_inclusive(subrequest.to_position_inclusive);
 
                 if replica_shard.is_gc_candidate() {
@@ -755,20 +740,21 @@ mod tests {
         .await
         .unwrap();
 
-        let mut mrecordlog_guard = ingester.mrecordlog.write().await;
+        let mut state_guard = ingester.state.write().await;
 
         let queue_ids: Vec<QueueId> = (1..=4)
             .map(|shard_id| queue_id("test-index:0", "test-source", shard_id))
             .collect();
 
         for queue_id in &queue_ids {
-            mrecordlog_guard.create_queue(queue_id).await.unwrap();
+            state_guard.mrecordlog.create_queue(queue_id).await.unwrap();
         }
         let records = [
             Bytes::from_static(b"test-doc-200"),
             Bytes::from_static(b"test-doc-201"),
         ];
-        mrecordlog_guard
+        state_guard
+            .mrecordlog
             .append_records(&queue_ids[1], None, records.into_iter())
             .await
             .unwrap();
@@ -776,7 +762,8 @@ mod tests {
             Bytes::from_static(b"test-doc-300"),
             Bytes::from_static(b"test-doc-301"),
         ];
-        mrecordlog_guard
+        state_guard
+            .mrecordlog
             .append_records(&queue_ids[2], None, records.into_iter())
             .await
             .unwrap();
@@ -784,17 +771,18 @@ mod tests {
             Bytes::from_static(b"test-doc-400"),
             Bytes::from_static(b"test-doc-401"),
         ];
-        mrecordlog_guard
+        state_guard
+            .mrecordlog
             .append_records(&queue_ids[3], None, records.into_iter())
             .await
             .unwrap();
-        drop(mrecordlog_guard);
+        drop(state_guard);
 
         ingester.init().await.unwrap();
 
-        let mrecordlog_guard = ingester.mrecordlog.read().await;
-        assert!(!mrecordlog_guard.queue_exists(&queue_ids[0]));
-        drop(mrecordlog_guard);
+        let state_guard = ingester.state.read().await;
+        assert!(!state_guard.mrecordlog.queue_exists(&queue_ids[0]));
+        drop(state_guard);
 
         let state_guard = ingester.state.read().await;
         assert_eq!(state_guard.primary_shards.len(), 2);
@@ -836,8 +824,8 @@ mod tests {
         assert_eq!(state_guard.primary_shards.len(), 1);
         assert!(!state_guard.primary_shards.contains_key(&queue_ids[1]));
 
-        let mrecordlog_guard = ingester.mrecordlog.read().await;
-        assert!(!mrecordlog_guard.queue_exists(&queue_ids[1]));
+        let state_guard = ingester.state.read().await;
+        assert!(!state_guard.mrecordlog.queue_exists(&queue_ids[1]));
     }
 
     #[tokio::test]
@@ -894,7 +882,6 @@ mod tests {
         ingester.persist(persist_request).await.unwrap();
 
         let state_guard = ingester.state.read().await;
-        let mrecordlog_guard = ingester.mrecordlog.read().await;
         assert_eq!(state_guard.primary_shards.len(), 3);
 
         let queue_id_00 = queue_id("test-index:0", "test-source", 0);
@@ -902,21 +889,25 @@ mod tests {
         primary_shard_00.assert_positions(None, NONE_REPLICA_POSITION);
         primary_shard_00.assert_is_open(None);
 
-        mrecordlog_guard.assert_records_eq(&queue_id_00, .., &[]);
+        state_guard
+            .mrecordlog
+            .assert_records_eq(&queue_id_00, .., &[]);
 
         let queue_id_01 = queue_id("test-index:0", "test-source", 1);
         let primary_shard_01 = state_guard.primary_shards.get(&queue_id_01).unwrap();
         primary_shard_01.assert_positions(0, NONE_REPLICA_POSITION);
         primary_shard_01.assert_is_open(0);
 
-        mrecordlog_guard.assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
+        state_guard
+            .mrecordlog
+            .assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
 
         let queue_id_10 = queue_id("test-index:1", "test-source", 0);
         let primary_shard_10 = state_guard.primary_shards.get(&queue_id_10).unwrap();
         primary_shard_10.assert_positions(1, NONE_REPLICA_POSITION);
         primary_shard_10.assert_is_open(1);
 
-        mrecordlog_guard.assert_records_eq(
+        state_guard.mrecordlog.assert_records_eq(
             &queue_id_10,
             ..,
             &[(0, "test-doc-100"), (1, "test-doc-101")],
@@ -1042,7 +1033,6 @@ mod tests {
         assert_eq!(persist_response.failures.len(), 0);
 
         let leader_state_guard = leader.state.read().await;
-        let leader_mrecordlog_guard = leader.mrecordlog.read().await;
         assert_eq!(leader_state_guard.primary_shards.len(), 3);
 
         let queue_id_00 = queue_id("test-index:0", "test-source", 0);
@@ -1050,21 +1040,25 @@ mod tests {
         primary_shard_00.assert_positions(None, Some(None));
         primary_shard_00.assert_is_open(None);
 
-        leader_mrecordlog_guard.assert_records_eq(&queue_id_00, .., &[]);
+        leader_state_guard
+            .mrecordlog
+            .assert_records_eq(&queue_id_00, .., &[]);
 
         let queue_id_01 = queue_id("test-index:0", "test-source", 1);
         let primary_shard_01 = leader_state_guard.primary_shards.get(&queue_id_01).unwrap();
         primary_shard_01.assert_positions(0, Some(0));
         primary_shard_01.assert_is_open(0);
 
-        leader_mrecordlog_guard.assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
+        leader_state_guard
+            .mrecordlog
+            .assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
 
         let queue_id_10 = queue_id("test-index:1", "test-source", 0);
         let primary_shard_10 = leader_state_guard.primary_shards.get(&queue_id_10).unwrap();
         primary_shard_10.assert_positions(1, Some(1));
         primary_shard_10.assert_is_open(1);
 
-        leader_mrecordlog_guard.assert_records_eq(
+        leader_state_guard.mrecordlog.assert_records_eq(
             &queue_id_10,
             ..,
             &[(0, "test-doc-100"), (1, "test-doc-101")],
@@ -1179,16 +1173,16 @@ mod tests {
         let queue_id_00 = queue_id("test-index:0", "test-source", 0);
 
         let leader_state_guard = leader.state.read().await;
-        let leader_mrecordlog_guard = leader.mrecordlog.read().await;
-        leader_mrecordlog_guard.assert_records_eq(&queue_id_00, .., &[]);
+        leader_state_guard
+            .mrecordlog
+            .assert_records_eq(&queue_id_00, .., &[]);
 
         let primary_shard = leader_state_guard.primary_shards.get(&queue_id_00).unwrap();
         primary_shard.assert_positions(None, Some(None));
         primary_shard.assert_is_open(None);
 
         let follower_state_guard = follower.state.read().await;
-        let follower_mrecordlog_guard = follower.mrecordlog.read().await;
-        assert!(!follower_mrecordlog_guard.queue_exists(&queue_id_00));
+        assert!(!follower_state_guard.mrecordlog.queue_exists(&queue_id_00));
 
         assert!(!follower_state_guard
             .replica_shards
@@ -1197,13 +1191,17 @@ mod tests {
         let queue_id_01 = queue_id("test-index:0", "test-source", 1);
 
         let leader_state_guard = leader.state.read().await;
-        leader_mrecordlog_guard.assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
+        leader_state_guard
+            .mrecordlog
+            .assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
 
         let primary_shard = leader_state_guard.primary_shards.get(&queue_id_01).unwrap();
         primary_shard.assert_positions(0, Some(0));
         primary_shard.assert_is_open(0);
 
-        follower_mrecordlog_guard.assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
+        follower_state_guard
+            .mrecordlog
+            .assert_records_eq(&queue_id_01, .., &[(0, "test-doc-010")]);
 
         let replica_shard = follower_state_guard
             .replica_shards
@@ -1214,7 +1212,7 @@ mod tests {
 
         let queue_id_10 = queue_id("test-index:1", "test-source", 0);
 
-        leader_mrecordlog_guard.assert_records_eq(
+        leader_state_guard.mrecordlog.assert_records_eq(
             &queue_id_10,
             ..,
             &[(0, "test-doc-100"), (1, "test-doc-101")],
@@ -1224,7 +1222,7 @@ mod tests {
         primary_shard.assert_positions(1, Some(1));
         primary_shard.assert_is_open(1);
 
-        follower_mrecordlog_guard.assert_records_eq(
+        follower_state_guard.mrecordlog.assert_records_eq(
             &queue_id_10,
             ..,
             &[(0, "test-doc-100"), (1, "test-doc-101")],
@@ -1347,44 +1345,46 @@ mod tests {
         .await
         .unwrap();
 
-        let queue_id_00 = queue_id("test-index:0", "test-source", 0);
         let queue_id_01 = queue_id("test-index:0", "test-source", 1);
+        let queue_id_02 = queue_id("test-index:0", "test-source", 2);
 
         let mut ingester_state = ingester.state.write().await;
         ingester
-            .init_primary_shard(&mut ingester_state, &queue_id_00, &self_node_id, None)
+            .init_primary_shard(&mut ingester_state, &queue_id_01, &self_node_id, None)
             .await
             .unwrap();
         ingester
-            .init_primary_shard(&mut ingester_state, &queue_id_01, &self_node_id, None)
+            .init_primary_shard(&mut ingester_state, &queue_id_02, &self_node_id, None)
             .await
             .unwrap();
 
         drop(ingester_state);
 
-        let mut mrecordlog_guard = ingester.mrecordlog.write().await;
+        let mut state_guard = ingester.state.write().await;
 
         let records = [
-            Bytes::from_static(b"test-doc-000"),
-            Bytes::from_static(b"test-doc-001"),
+            Bytes::from_static(b"test-doc-foo"),
+            Bytes::from_static(b"test-doc-bar"),
         ]
         .into_iter();
-        mrecordlog_guard
-            .append_records(&queue_id_00, None, records)
+        state_guard
+            .mrecordlog
+            .append_records(&queue_id_01, None, records)
             .await
             .unwrap();
 
         let records = [
-            Bytes::from_static(b"test-doc-010"),
-            Bytes::from_static(b"test-doc-011"),
+            Bytes::from_static(b"test-doc-qux"),
+            Bytes::from_static(b"test-doc-baz"),
         ]
         .into_iter();
-        mrecordlog_guard
-            .append_records(&queue_id_00, None, records)
+        state_guard
+            .mrecordlog
+            .append_records(&queue_id_01, None, records)
             .await
             .unwrap();
 
-        drop(mrecordlog_guard);
+        drop(state_guard);
 
         let truncate_request = TruncateRequest {
             ingester_id: self_node_id.to_string(),
@@ -1392,47 +1392,52 @@ mod tests {
                 TruncateSubrequest {
                     index_uid: "test-index:0".to_string(),
                     source_id: "test-source".to_string(),
-                    shard_id: 0,
+                    shard_id: 1,
                     to_position_inclusive: 0,
                 },
                 TruncateSubrequest {
                     index_uid: "test-index:0".to_string(),
                     source_id: "test-source".to_string(),
-                    shard_id: 1,
+                    shard_id: 2,
                     to_position_inclusive: 1,
                 },
                 TruncateSubrequest {
                     index_uid: "test-index:1337".to_string(),
                     source_id: "test-source".to_string(),
-                    shard_id: 0,
+                    shard_id: 1,
                     to_position_inclusive: 1337,
                 },
             ],
         };
         ingester.truncate(truncate_request).await.unwrap();
 
-        let ingester_state = ingester.state.read().await;
-        ingester_state
-            .primary_shards
-            .get(&queue_id_00)
-            .unwrap()
-            .assert_publish_position(0);
-        ingester_state
+        let state_guard = ingester.state.read().await;
+
+        state_guard
             .primary_shards
             .get(&queue_id_01)
             .unwrap()
+            .assert_publish_position(0);
+        state_guard
+            .primary_shards
+            .get(&queue_id_02)
+            .unwrap()
             .assert_publish_position(1);
 
-        let mrecordlog_guard = ingester.mrecordlog.read().await;
-        let (position, record) = mrecordlog_guard
-            .range(&queue_id_00, 0..)
+        let (position, record) = state_guard
+            .mrecordlog
+            .range(&queue_id_01, 0..)
             .unwrap()
             .next()
             .unwrap();
         assert_eq!(position, 1);
-        assert_eq!(&*record, b"test-doc-001");
+        assert_eq!(&*record, b"test-doc-bar");
 
-        let record_opt = mrecordlog_guard.range(&queue_id_01, 0..).unwrap().next();
+        let record_opt = state_guard
+            .mrecordlog
+            .range(&queue_id_02, 0..)
+            .unwrap()
+            .next();
         assert!(record_opt.is_none());
     }
 }

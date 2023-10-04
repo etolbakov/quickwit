@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mrecordlog::error::DeleteQueueError;
-use mrecordlog::MultiRecordLog;
 use once_cell::sync::Lazy;
 use quickwit_proto::ingest::IngestV2Result;
 use quickwit_proto::metastore::{DeleteShardsRequest, DeleteShardsSubrequest};
@@ -57,7 +56,6 @@ static MAX_CONCURRENCY_SEMAPHORE: Lazy<Arc<Semaphore>> =
 /// 3. deletes the associated mrecordlog queues
 pub(super) struct GcTask {
     metastore: Arc<dyn IngestMetastore>,
-    mrecordlog: Arc<RwLock<MultiRecordLog>>,
     state: Arc<RwLock<IngesterState>>,
     gc_candidates: Vec<QueueId>,
 }
@@ -65,7 +63,6 @@ pub(super) struct GcTask {
 impl GcTask {
     pub fn spawn(
         metastore: Arc<dyn IngestMetastore>,
-        mrecordlog: Arc<RwLock<MultiRecordLog>>,
         state: Arc<RwLock<IngesterState>>,
         gc_candidates: Vec<QueueId>,
     ) {
@@ -74,7 +71,6 @@ impl GcTask {
         }
         let gc_task = Self {
             metastore,
-            mrecordlog,
             state,
             gc_candidates,
         };
@@ -127,11 +123,11 @@ impl GcTask {
         }
         drop(state_guard);
 
-        let mut mrecordlog_guard = self.mrecordlog.write().await;
+        let mut state_guard = self.state.write().await;
 
         for gc_candidate in &self.gc_candidates {
             if let Err(DeleteQueueError::IoError(error)) =
-                mrecordlog_guard.delete_queue(gc_candidate).await
+                state_guard.mrecordlog.delete_queue(gc_candidate).await
             {
                 error!("failed to delete mrecordlog queue: {}", error);
             }
@@ -143,6 +139,7 @@ impl GcTask {
 
 #[cfg(test)]
 mod tests {
+    use mrecordlog::MultiRecordLog;
     use quickwit_proto::ingest::ShardState;
     use quickwit_proto::metastore::DeleteShardsResponse;
     use quickwit_proto::queue_id;
@@ -178,9 +175,9 @@ mod tests {
         for queue_id in [&queue_id_0, &queue_id_1] {
             mrecordlog.create_queue(queue_id).await.unwrap();
         }
-        let mrecordlog = Arc::new(RwLock::new(mrecordlog));
 
         let mut state = IngesterState {
+            mrecordlog,
             primary_shards: HashMap::new(),
             replica_shards: HashMap::new(),
             replication_clients: HashMap::new(),
@@ -206,7 +203,6 @@ mod tests {
 
         let gc_task = GcTask {
             metastore,
-            mrecordlog: mrecordlog.clone(),
             state: state.clone(),
             gc_candidates: vec![queue_id_0, queue_id_1],
         };
@@ -216,10 +212,7 @@ mod tests {
         assert!(state_guard.primary_shards.is_empty());
         assert!(state_guard.replica_shards.is_empty());
 
-        let mrecordlog_guard = mrecordlog.read().await;
-        assert!(mrecordlog_guard
-            .list_queues()
-            .collect::<Vec<_>>()
-            .is_empty());
+        let state_guard = state.read().await;
+        assert_eq!(state_guard.mrecordlog.list_queues().count(), 0);
     }
 }
