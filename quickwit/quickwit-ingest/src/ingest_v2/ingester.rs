@@ -55,6 +55,7 @@ use super::ingest_metastore::IngestMetastore;
 use super::models::{Position, PrimaryShard, ReplicaShard, ShardStatus};
 use super::replication::{
     ReplicationClient, ReplicationClientTask, ReplicationTask, ReplicationTaskHandle,
+    SYN_REPLICATION_STREAM_CAPACITY,
 };
 use super::IngesterPool;
 use crate::metrics::INGEST_METRICS;
@@ -282,10 +283,11 @@ impl Ingester {
             follower_id: follower_id.clone().into(),
         };
         let open_message = SynReplicationMessage::new_open_request(open_request);
-        let (syn_replication_stream_tx, syn_replication_stream) = ServiceStream::new_bounded(5);
+        let (syn_replication_stream_tx, syn_replication_stream) =
+            ServiceStream::new_bounded(SYN_REPLICATION_STREAM_CAPACITY);
         syn_replication_stream_tx
             .try_send(open_message)
-            .expect("The channel should be open and have capacity.");
+            .expect("channel should be open and have capacity");
 
         let mut ingester =
             self.ingester_pool
@@ -302,7 +304,7 @@ impl Ingester {
             .expect("TODO")
             .expect("")
             .into_open_response()
-            .expect("The first message should be an open response.");
+            .expect("first message should be an open response");
 
         let replication_client =
             ReplicationClientTask::spawn(syn_replication_stream_tx, ack_replication_stream);
@@ -440,7 +442,7 @@ impl IngesterService for Ingester {
             let replication_client = state_guard
                 .replication_clients
                 .get(&follower_id)
-                .expect("the replication client should be initialized")
+                .expect("replication client should be initialized")
                 .clone();
             replicate_futures
                 .push(async move { replication_client.replicate(replicate_request).await });
@@ -450,9 +452,17 @@ impl IngesterService for Ingester {
         // requests in the same order.
         drop(state_guard);
 
-        while let Some(replicate_result) = replicate_futures.next().await {
-            let replicate_response = replicate_result?;
-
+        while let Some(replication_result) = replicate_futures.next().await {
+            let replicate_response = match replication_result {
+                Ok(replicate_response) => replicate_response,
+                Err(_) => {
+                    // TODO: Handle replication error:
+                    // 1. Close and evict all the shards hosted by the follower.
+                    // 2. Close and evict the replication client.
+                    // 3. Return `PersistFailureKind::ShardClose` to router.
+                    continue;
+                }
+            };
             for replicate_success in replicate_response.successes {
                 let persist_success = PersistSuccess {
                     index_uid: replicate_success.index_uid,
@@ -467,6 +477,7 @@ impl IngesterService for Ingester {
 
         for persist_success in &persist_successes {
             let queue_id = persist_success.queue_id();
+
             state_guard
                 .primary_shards
                 .get_mut(&queue_id)
@@ -492,7 +503,7 @@ impl IngesterService for Ingester {
             .await
             .ok_or_else(|| IngestV2Error::Internal("syn replication stream aborted".to_string()))?
             .into_open_request()
-            .expect("the first message should be an open replication stream request");
+            .expect("first message should be an open replication stream request");
 
         if open_replication_stream_request.follower_id != self.self_node_id {
             return Err(IngestV2Error::Internal("routing error".to_string()));
@@ -507,13 +518,14 @@ impl IngesterService for Ingester {
                 "a replication stream betwen {leader_id} and {follower_id} is already opened"
             )));
         };
-        let (ack_replication_stream_tx, ack_replication_stream) = ServiceStream::new_bounded(5);
+        // There is no need to bound the capacity of the channel here because it is already
+        // virtually bounded by the capacity of the SYN replication stream.
+        let (ack_replication_stream_tx, ack_replication_stream) = ServiceStream::new_unbounded();
         let open_response = OpenReplicationStreamResponse {};
         let ack_replication_message = AckReplicationMessage::new_open_response(open_response);
         ack_replication_stream_tx
             .send(Ok(ack_replication_message))
-            .await
-            .expect("channel should be open and have enough capacity");
+            .expect("channel should be open");
 
         let replication_task_handle = ReplicationTask::spawn(
             leader_id,
