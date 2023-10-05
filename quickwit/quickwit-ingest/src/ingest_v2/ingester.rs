@@ -20,7 +20,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
-use std::iter::once;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +52,7 @@ use super::fetch::FetchTask;
 use super::gc::GcTask;
 use super::ingest_metastore::IngestMetastore;
 use super::models::{Position, PrimaryShard, ReplicaShard, ShardStatus};
+use super::mrecord::MRecord;
 use super::replication::{
     ReplicationClient, ReplicationClientTask, ReplicationTask, ReplicationTaskHandle,
     SYN_REPLICATION_STREAM_CAPACITY,
@@ -372,21 +372,22 @@ impl IngesterService for Ingester {
                 persist_successes.push(persist_success);
                 continue;
             };
-            let primary_position_inclusive = if force_commit {
-                let docs = doc_batch.docs().chain(once(commit_doc()));
-                state_guard
+            let mrecords = doc_batch.docs().map(|doc| MRecord::new_doc(doc).encode());
+
+            let mut primary_position_inclusive = state_guard
+                .mrecordlog
+                .append_records(&queue_id, None, mrecords)
+                .await
+                .expect("TODO"); // TODO: Io error, close shard?
+
+            if force_commit {
+                let mrecord = MRecord::new_commit().encode();
+                primary_position_inclusive = state_guard
                     .mrecordlog
-                    .append_records(&queue_id, None, docs)
+                    .append_record(&queue_id, None, mrecord)
                     .await
-                    .expect("TODO") // TODO: Io error, close shard?
-            } else {
-                let docs = doc_batch.docs();
-                state_guard
-                    .mrecordlog
-                    .append_records(&queue_id, None, docs)
-                    .await
-                    .expect("TODO") // TODO: Io error, close shard?
-            };
+                    .expect("TODO"); // TODO: Io error, close shard?
+            }
             let batch_num_bytes = doc_batch.num_bytes() as u64;
             let batch_num_docs = doc_batch.num_docs() as u64;
 

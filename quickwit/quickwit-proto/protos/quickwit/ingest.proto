@@ -33,6 +33,19 @@ message DocBatchV2 {
     repeated uint32 doc_lengths = 2;
 }
 
+message DocHeader {
+}
+
+message CommitHeader {
+}
+
+message MRecordHeader {
+    oneof header {
+        DocHeader doc_header = 1;
+        CommitHeader commit_header = 2;
+    }
+}
+
 enum ShardState {
     // The shard is open and accepts write requests.
     OPEN = 0;

@@ -22,6 +22,7 @@ mod gc;
 mod ingest_metastore;
 mod ingester;
 mod models;
+mod mrecord;
 mod replication;
 mod router;
 mod shard_table;

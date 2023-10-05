@@ -171,7 +171,8 @@ impl ReplicationClientTask {
             }
             // The ACK replication stream was closed.
         };
-        // Because of the way the futures are constructed, if any of the streams or channels is closed, both futures will complete.
+        // Because of the way the futures are constructed, if any of the streams or channels is
+        // closed, both futures will complete.
         tokio::spawn(enqueue_requests_fut);
         tokio::spawn(dequeue_responses_fut);
     }

@@ -8,6 +8,34 @@ pub struct DocBatchV2 {
     pub doc_lengths: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DocHeader {}
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CommitHeader {}
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MRecordHeader {
+    #[prost(oneof = "m_record_header::Header", tags = "1, 2")]
+    pub header: ::core::option::Option<m_record_header::Header>,
+}
+/// Nested message and enum types in `MRecordHeader`.
+pub mod m_record_header {
+    #[derive(Serialize, Deserialize, utoipa::ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Header {
+        #[prost(message, tag = "1")]
+        DocHeader(super::DocHeader),
+        #[prost(message, tag = "2")]
+        CommitHeader(super::CommitHeader),
+    }
+}
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 #[derive(Eq)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -177,6 +177,20 @@ impl ShardState {
     }
 }
 
+impl MRecordHeader {
+    pub fn new_doc() -> Self {
+        Self {
+            header: Some(m_record_header::Header::DocHeader(DocHeader {})),
+        }
+    }
+
+    pub fn new_commit() -> Self {
+        Self {
+            header: Some(m_record_header::Header::CommitHeader(CommitHeader {})),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
