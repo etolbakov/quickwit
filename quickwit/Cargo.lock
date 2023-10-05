@@ -5522,6 +5522,7 @@ dependencies = [
  "quickwit-doc-mapper",
  "quickwit-index-management",
  "quickwit-indexing",
+ "quickwit-ingest",
  "quickwit-metastore",
  "quickwit-proto",
  "quickwit-rest-client",
