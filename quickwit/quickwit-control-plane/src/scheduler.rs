@@ -196,6 +196,7 @@ impl IndexingScheduler {
         Ok(source_configs)
     }
 
+    /// Returns, for all of the ingest api source, a map with the list of their available shard ids.
     async fn fetch_shards(
         &self,
         source_configs: &HashMap<SourceUid, SourceConfig>,
@@ -339,6 +340,8 @@ impl IndexingScheduler {
             .context("error when scheduling indexing plan")?;
         Ok(())
     }
+
+    pub fn delete_index(&self) {}
 }
 
 struct IndexingPlansDiff<'a> {
